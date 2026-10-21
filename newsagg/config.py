@@ -32,13 +32,14 @@ class ChannelConfig(BaseModel):
     schedule: list[str] = Field(default_factory=lambda: ["0 20 * * *"])
     header: str | None = "📰 <b>Știrile zilei, {date}</b>"
     lookback_hours: int = 24
+    max_per_subject: int = 2  # at most this many lines about the same person or organisation
 
 
 class SectionConfig(BaseModel):
     id: str
     title: str | None = None
     regions: list[str]
-    max_items: int = 8
+    max_items: int = 6
 
 
 class RegionConfig(BaseModel):
@@ -99,6 +100,7 @@ class LLMConfig(BaseModel):
     effort: str | None = "low"
     classify: bool = True
     write_lines: bool = True
+    curate: bool = True  # at digest time, keep one line per event (same event reported several ways)
     batch_size: int = 20
     min_importance: int = 3
 
