@@ -1,0 +1,120 @@
+# newsagg configuration. ${VAR} values come from the environment (.env file with Docker).
+
+database_url: ${DATABASE_URL}
+
+channel:
+  bot_token: ${TELEGRAM_BOT_TOKEN}
+  chat_id: ${TELEGRAM_CHANNEL_ID}            # e.g. @my_channel or -100123...
+  review_chat_id: ${TELEGRAM_REVIEW_CHAT_ID}  # your private chat with the bot; drafts go here first
+  language: ro
+  timezone: Europe/Chisinau
+  schedule: ["0 20 * * *"]                     # daily at 20:00; add more cron lines for more digests
+  lookback_hours: 24
+  header: "📰 <b>Știrile zilei, {date}</b>"
+
+# Order matters: sections appear in this order in the digest.
+sections:
+  - id: moldova
+    title: null                 # first block has no header, like Redactia
+    regions: [moldova]
+    max_items: 10
+  - id: romania
+    title: "::: ROMÂNIA"
+    regions: [romania]
+    max_items: 6
+  - id: externe
+    title: "::: EXTERNE"
+    regions: [world]
+    max_items: 5
+
+# Order matters for keyword matching: the first region whose keywords hit wins.
+# The LLM labeller uses the descriptions; keywords are the fallback when the LLM is off or fails.
+regions:
+  moldova:
+    description: Republic of Moldova, including Transnistria and Gagauzia, and Moldovan diaspora
+    keywords: [Moldov, Chișinău, Chisinau, Bălți, Balti, Transnistri, Tiraspol, Găgăuzi, Gagauzi, Comrat,
+               Maia Sandu, Recean, Munteanu, Partidul Acțiune și Solidaritate, PSRM, Dodon, Grosu, Igor Grosu, Parlamentul de la Chișinău]
+  romania:
+    description: Romania (domestic Romanian news)
+    keywords: [România, Romania, București, Bucuresti, Nicușor Dan, Bolojan, Guvernul României, PSD, PNL, USR, partidul AUR]
+  world:
+    description: International news outside Moldova and Romania (Ukraine, Russia, EU, USA, Middle East, etc.)
+    keywords: [Ucrain, Kiev, Kyiv, Rusia, Rusiei, Moscov, Kremlin, Putin, Zelenski, Uniunea European, Bruxelles,
+               NATO, SUA, Trump, Washington, China, Israel, Gaza, Iran, Turcia, Ungari, Bulgari, Polonia, Germania, Franța]
+  other:
+    description: Anything else (sport results, celebrities, lifestyle) that should not go in the digest
+
+topics:
+  politics:   {emoji: "🏛", keywords: [Parlament, guvern, ministr, partid, alegeri, deputat, premier, președint]}
+  justice:    {emoji: "⚖️", keywords: [instanț, procuror, judecăt, dosar, CSM, CSJ, DNA, anticorupție, condamnat]}
+  economy:    {emoji: "💰", keywords: [econom, buget, inflați, prețur, tarif, bancă, BNM, BNR, salari, pensi, taxe]}
+  energy:     {emoji: "⚡", keywords: [energi, gaze, Moldovagaz, Energocom, curent electric, termoficare]}
+  infrastructure: {emoji: "🛣", keywords: [drumul, drumuri, autostrad, podul, cale ferată, aeroport, apeduct]}
+  security:   {emoji: "🛡", keywords: [armat, apărare, militar, SIS, securitat, poliți]}
+  war:        {emoji: "💥", keywords: [atac, rachet, drone, bombard, front, ofensiv]}
+  eu:         {emoji: "🇪🇺", keywords: [Uniunea European, Comisia European, Parlamentul European, aderare]}
+  health:     {emoji: "🏥", keywords: [sănătat, spital, medic, vaccin, epidemi]}
+  education:  {emoji: "🎓", keywords: [școal, elev, student, universit, bacalaureat, profesor]}
+  society:    {emoji: "👥", keywords: [protest, social, diaspora, populați]}
+  accident:   {emoji: "🚨", keywords: [accident, incendiu, explozi, victim, mort]}
+  weather:    {emoji: "🌦", keywords: [meteo, ploi, ninsoare, caniculă, cod galben, cod portocaliu, inundați]}
+  default:    {emoji: "📰"}
+
+# priority: lower is better; when several outlets cover a story, the best-ranked one gets the link.
+# Feeds marked "checked" returned valid RSS on 2026-10-08. Run `newsagg test-source <id>` to check any of them.
+sources:
+  # --- Moldova ---
+  - {id: zdg,          type: rss, name: Ziarul de Gardă, url: "https://www.zdg.md/feed/",        region: moldova, priority: 1}  # checked
+  - {id: newsmaker,    type: rss, name: NewsMaker,       url: "https://newsmaker.md/ro/feed/",   region: moldova, priority: 1}  # checked
+  - {id: tv8,          type: rss, name: TV8,             url: "https://tv8.md/feed",             region: moldova, priority: 2}  # checked
+  - {id: unimedia,     type: rss, name: Unimedia,        url: "https://unimedia.info/ro/rss/all/", region: moldova, priority: 2}  # checked
+  - {id: point,        type: rss, name: Point.md,        url: "https://point.md/ro/rss",         region: moldova, priority: 3}  # checked
+  - {id: realitatea_md, type: rss, name: Realitatea.md,  url: "https://realitatea.md/feed/",     region: moldova, priority: 3}  # checked
+  - {id: diez,         type: rss, name: Diez,            url: "https://diez.md/feed/",           region: moldova, priority: 5}  # checked
+  - {id: ipn,          type: rss, name: IPN,             url: "https://www.ipn.md/ro/feed",      region: moldova, priority: 2, enabled: false}  # linked from ipn.md, but returned 404 when checked
+
+  # --- Romania ---
+  - {id: digi24,       type: rss, name: Digi24,          url: "https://www.digi24.ro/rss",       region: romania, priority: 1}  # checked
+  - {id: g4media,      type: rss, name: G4Media,         url: "https://www.g4media.ro/feed",     region: romania, priority: 1}  # checked
+  - {id: hotnews,      type: rss, name: HotNews,         url: "https://hotnews.ro/feed",         region: romania, priority: 1}  # checked
+  - {id: newsro,       type: rss, name: News.ro,         url: "https://www.news.ro/rss",         region: romania, priority: 2}  # checked
+  - {id: adevarul,     type: rss, name: Adevărul,        url: "https://adevarul.ro/rss",         region: romania, priority: 3}  # checked
+  - {id: mediafax,     type: rss, name: Mediafax,        url: "https://www.mediafax.ro/rss",     region: romania, priority: 3}  # checked
+  - {id: spotmedia,    type: rss, name: Spotmedia,       url: "https://spotmedia.ro/feed",       region: romania, priority: 2}  # checked
+  - {id: recorder,     type: rss, name: Recorder,        url: "https://recorder.ro/feed/",       region: romania, priority: 1, interval_minutes: 60}  # checked
+  - {id: libertatea,   type: rss, name: Libertatea,      url: "https://www.libertatea.ro/rss",   region: romania, priority: 3, enabled: false}  # not checked
+
+  # --- International, in Romanian ---
+  - {id: digi24_externe, type: rss, name: Digi24 Externe, url: "https://www.digi24.ro/rss/stiri/externe", region: world, priority: 1}  # checked
+  - {id: dw_ro,        type: rss, name: DW România,      url: "https://rss.dw.com/rdf/rss-rom-all", region: world, priority: 2, enabled: false}  # not checked
+
+  # --- Telegram channels (public web preview, no login) ---
+  # - {id: some_channel, type: telegram, channel: some_public_channel, region: moldova, priority: 4}
+
+  # --- Websites without a feed ---
+  # - {id: some_site, type: website, url: "https://example.md/stiri", link_selector: "article h2 a", region: moldova}
+
+filter:
+  max_age_hours: 36
+  blocklist: [horoscop, rețet, reteta, "(P)", publicitate, "cod de reducere", promoți, "ce mâncăm", bancul zilei]
+
+dedupe:
+  window_hours: 48
+  title_similarity: 80     # 0-100; lower merges more aggressively
+  min_tokens: 4
+
+llm:
+  enabled: true
+  provider: openai_compatible          # or openai_compatible (OpenAI, Gemini, Mistral, Groq, OpenRouter, Ollama)
+  model: anthropic/claude-haiku-5.5
+  api_key: ${LLM_API_KEY}
+  base_url: ${LLM_BASE_URL:-}  # only for openai_compatible, e.g. https://api.openai.com/v1
+  effort: low
+  classify: true
+  write_lines: true
+  batch_size: 20
+  min_importance: 3            # stories below this are kept for dedupe but get no line
+
+worker:
+  poll_seconds: 60
+  batch_size: 50

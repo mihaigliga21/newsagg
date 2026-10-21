@@ -1,0 +1,17 @@
+# Copy to .env and fill in. Never commit .env.
+
+# Supabase: Project Settings > Database > Connection string > "Session pooler" (port 5432).
+# Do not use the transaction pooler (port 6543): it does not support LISTEN/NOTIFY.
+DATABASE_URL=postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
+
+# Telegram: create a bot with @BotFather, add it as admin of the channel with "Post messages".
+TELEGRAM_BOT_TOKEN=123456:ABC...
+TELEGRAM_CHANNEL_ID=@your_channel
+# Your own user id (send /start to @userinfobot to get it). Start a chat with your bot once.
+TELEGRAM_REVIEW_CHAT_ID=123456789
+
+# LLM (Anthropic by default). For openai_compatible also set LLM_BASE_URL.
+LLM_API_KEY=sk-ant-...
+LLM_BASE_URL=
+
+LOG_LEVEL=INFO

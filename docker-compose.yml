@@ -1,0 +1,55 @@
+# One image, one container per stage. Stages talk only through Postgres (Supabase).
+#   docker compose up -d --build        start everything (runs the migration first)
+#   docker compose logs -f              follow all stages
+#   docker compose run --rm migrate     re-apply the schema after an upgrade
+#
+# Local Postgres instead of Supabase: `docker compose --profile localdb up -d --build`
+# with DATABASE_URL=postgresql://newsagg:newsagg@db:5432/newsagg in .env.
+
+x-app: &app
+  build: .
+  image: newsagg:latest
+  env_file: .env
+  restart: unless-stopped
+  volumes:
+    - ./config:/app/config:ro      # edit config.yaml, then `docker compose restart`
+
+services:
+  migrate:
+    <<: *app
+    command: ["migrate"]
+    restart: "no"
+    depends_on: {db: {condition: service_started, required: false}}
+
+  collector:
+    <<: *app
+    command: ["run", "collector"]
+    depends_on: {migrate: {condition: service_completed_successfully}}
+
+  processor:
+    <<: *app
+    command: ["run", "processor"]
+    depends_on: {migrate: {condition: service_completed_successfully}}
+
+  writer:
+    <<: *app
+    command: ["run", "writer"]
+    depends_on: {migrate: {condition: service_completed_successfully}}
+
+  publisher:
+    <<: *app
+    command: ["run", "publisher"]
+    depends_on: {migrate: {condition: service_completed_successfully}}
+
+  db:
+    profiles: [localdb]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: newsagg
+      POSTGRES_PASSWORD: newsagg
+      POSTGRES_DB: newsagg
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+
+volumes:
+  pgdata:
