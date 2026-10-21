@@ -1,6 +1,10 @@
 """Stage 4: on schedule, pick the best written stories, build the digest, send it for review,
 and post it to the channel once approved.
 
+Picking: stories are ranked by `score`; then an LLM groups the top candidates by real-world event
+so each event gets one line, and no person or organisation fills more than `max_per_subject` lines.
+If the LLM is off or fails, the plain ranking is used.
+
 Review chat commands: /digest builds a digest now, /status shows pipeline counts.
 """
 
@@ -13,9 +17,14 @@ from zoneinfo import ZoneInfo
 from croniter import croniter
 from psycopg.types.json import Jsonb
 
-from ..render import format_date, render_digest, render_line
+from ..llm import build_provider
+from ..prompts import DigestPlan, curate_system, curate_user
+from ..render import format_date, join_text, render_digest, render_line, tidy_line
 from ..telegram import TelegramBot, TelegramError
-from .base import Stage
+from ..textutil import normalize_title
+from .base import DEFAULT, Stage
+
+CANDIDATES_PER_SLOT = 3  # how many ranked candidates per section slot the LLM sees
 
 
 def score(story: dict, now: datetime) -> float:
@@ -28,18 +37,72 @@ def score(story: dict, now: datetime) -> float:
     )
 
 
+def line_text(story: dict) -> str:
+    line = tidy_line(story.get("line") or {})
+    return join_text(line.get("lead") or "", line.get("rest") or "") or story["title"]
+
+
+def apply_plan(
+    ranked: dict[str, list[dict]],
+    plan: DigestPlan | None,
+    max_items: dict[str, int],
+    max_per_subject: int,
+    scores: dict[int, float],
+) -> tuple[dict[str, list[dict]], list[int]]:
+    """Picks the digest lines. `ranked` holds each section's candidates, best first.
+
+    Returns the chosen stories per section, and the ids of candidates folded into a chosen line
+    (same event), which go out with the digest so they do not come back in the next one.
+    """
+    stories = {s["id"]: s for lst in ranked.values() for s in lst}
+    rank = {sid: i for lst in ranked.values() for i, sid in enumerate(s["id"] for s in lst)}
+    events: list[tuple[int, list[int], str | None]] = []  # (kept id, all ids, subject)
+    seen: set[int] = set()
+    for ev in plan.events if plan else []:
+        ids = [i for i in dict.fromkeys(ev.ids) if i in stories and i not in seen]
+        if not ids:
+            continue
+        keep = ev.keep if ev.keep in ids else min(ids, key=rank.get)
+        seen.update(ids)
+        events.append((keep, ids, normalize_title(ev.subject) or None))
+    events += [(sid, [sid], None) for sid in stories if sid not in seen]
+
+    # An event reported by several candidates ranks like a story with more sources.
+    def event_score(ev):
+        return max(scores[i] for i in ev[1]) + 4 * min(len(ev[1]) - 1, 3)
+
+    chosen: dict[str, list[dict]] = {sec: [] for sec in ranked}
+    folded: list[int] = []
+    per_subject: dict[str, int] = {}
+    for keep, ids, subject in sorted(events, key=event_score, reverse=True):
+        sec = stories[keep]["section"]
+        if len(chosen[sec]) >= max_items.get(sec, 0):
+            continue
+        if subject and per_subject.get(subject, 0) >= max_per_subject:
+            continue
+        if subject:
+            per_subject[subject] = per_subject.get(subject, 0) + 1
+        chosen[sec].append(stories[keep])
+        folded += [i for i in ids if i != keep]
+    return chosen, folded
+
+
 class Publisher(Stage):
     name = "publisher"
 
-    def __init__(self, cfg, db, bot: TelegramBot | None = None):
+    def __init__(self, cfg, db, bot: TelegramBot | None = None, llm=DEFAULT):
         super().__init__(cfg, db)
+        if llm is DEFAULT:
+            llm = build_provider(cfg.llm) if cfg.llm.enabled and cfg.llm.curate else None
+        self.llm = llm
         self.bot = bot or TelegramBot(cfg.channel.bot_token)
         self.tz = ZoneInfo(cfg.channel.timezone)
         self.review_chat = cfg.channel.review_chat_id
 
     # ---------- building ----------
 
-    async def select_stories(self) -> dict[str, list[dict]]:
+    async def select_stories(self) -> tuple[dict[str, list[dict]], list[int]]:
+        """Returns the chosen stories per section and the ids folded into them (see `apply_plan`)."""
         rows = await self.db.fetch(
             """select * from stories
                where status = 'written' and digest_id is null
@@ -47,11 +110,29 @@ class Publisher(Stage):
             (self.cfg.channel.lookback_hours,),
         )
         now = datetime.now(timezone.utc)
-        by_section: dict[str, list[dict]] = {}
+        scores = {r["id"]: score(r, now) for r in rows}
+        ranked: dict[str, list[dict]] = {}
         for sec in self.cfg.sections:
-            chosen = sorted((r for r in rows if r["section"] == sec.id), key=lambda r: score(r, now), reverse=True)
-            by_section[sec.id] = chosen[: sec.max_items]
-        return by_section
+            in_sec = sorted((r for r in rows if r["section"] == sec.id), key=lambda r: scores[r["id"]], reverse=True)
+            ranked[sec.id] = in_sec[: sec.max_items * CANDIDATES_PER_SLOT]
+        plan = await self.plan_events([s for lst in ranked.values() for s in lst])
+        return apply_plan(
+            ranked, plan, {sec.id: sec.max_items for sec in self.cfg.sections},
+            self.cfg.channel.max_per_subject, scores,
+        )
+
+    async def plan_events(self, candidates: list[dict]) -> DigestPlan | None:
+        if not self.llm or len(candidates) < 2:
+            return None
+        payload = [{"id": c["id"], "section": c["section"], "text": line_text(c)} for c in candidates]
+        try:
+            plan = await self.llm.generate(curate_system(self.cfg), curate_user(payload), DigestPlan, max_tokens=4000)
+        except Exception as exc:  # the digest must go out even if this step fails
+            self.log.warning("grouping digest candidates by event failed, using plain ranking: %s", exc)
+            return None
+        merged = sum(len(ev.ids) - 1 for ev in plan.events if ev.ids)
+        self.log.info("LLM grouped %d candidates into %d events (%d merged)", len(candidates), len(plan.events), merged)
+        return plan
 
     def render(self, by_section: dict[str, list[dict]]) -> list[str]:
         header = self.cfg.channel.header
@@ -64,7 +145,7 @@ class Publisher(Stage):
         return render_digest(sections, header)
 
     async def build_digest(self) -> int | None:
-        by_section = await self.select_stories()
+        by_section, folded = await self.select_stories()
         story_ids = [s["id"] for lst in by_section.values() for s in lst]
         if not story_ids:
             self.log.info("no stories for a digest")
@@ -79,7 +160,10 @@ class Publisher(Stage):
                 (status, Jsonb(parts), story_ids),
             )
             digest_id = (await cur.fetchone())["id"]
-            await conn.execute("update stories set digest_id = %s where id = any(%s)", (digest_id, story_ids))
+            # Folded duplicates belong to the digest too, so they are posted (or freed) with it.
+            await conn.execute(
+                "update stories set digest_id = %s where id = any(%s)", (digest_id, story_ids + folded)
+            )
         self.log.info("digest %d built with %d stories in %d parts", digest_id, len(story_ids), len(parts))
 
         if self.review_chat:

@@ -10,22 +10,24 @@ channel:
   timezone: Europe/Chisinau
   schedule: ["0 20 * * *"]                     # daily at 20:00; add more cron lines for more digests
   lookback_hours: 24
+  max_per_subject: 2                           # at most 2 lines about the same person or organisation
   header: "📰 <b>Știrile zilei, {date}</b>"
 
 # Order matters: sections appear in this order in the digest.
+# 6 + 4 + 3 lines keep the digest inside one Telegram message (4096 characters).
 sections:
   - id: moldova
     title: null                 # first block has no header, like Redactia
     regions: [moldova]
-    max_items: 10
+    max_items: 6
   - id: romania
     title: "::: ROMÂNIA"
     regions: [romania]
-    max_items: 6
+    max_items: 4
   - id: externe
     title: "::: EXTERNE"
     regions: [world]
-    max_items: 5
+    max_items: 3
 
 # Order matters for keyword matching: the first region whose keywords hit wins.
 # The LLM labeller uses the descriptions; keywords are the fallback when the LLM is off or fails.
@@ -112,6 +114,7 @@ llm:
   effort: low
   classify: true
   write_lines: true
+  curate: true                 # at digest time, group lines by event and keep one per event
   batch_size: 20
   min_importance: 3            # stories below this are kept for dedupe but get no line
 

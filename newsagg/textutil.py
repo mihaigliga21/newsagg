@@ -58,3 +58,22 @@ def first_sentence(text: str, max_len: int = 200) -> str:
 
 def truncate(text: str, max_len: int) -> str:
     return text if len(text) <= max_len else text[:max_len].rsplit(" ", 1)[0] + "…"
+
+
+_MEDIA_WORDS = r"(?:VIDEO|FOTO|FOTOGALERIE|GALERIE FOTO|AUDIO|LIVE|LIVETEXT|LIVE TEXT|DOC|UPDATE)"
+_MEDIA_BRACKETED_RE = re.compile(
+    rf"\s*[(\[]\s*{_MEDIA_WORDS}(?:\s*[/,|+]\s*{_MEDIA_WORDS})*\s*[)\]]\s*", re.IGNORECASE
+)
+# Upper-case tags only, so "Live" or "foto" inside a sentence stay.
+_MEDIA_LEADING_RE = re.compile(rf"^(?:{_MEDIA_WORDS}\s*(?:[/|:,–-]\s*|\s+))+")
+_MEDIA_TRAILING_RE = re.compile(rf"(?:\s*[/|:,–-]?\s*\b{_MEDIA_WORDS})+\s*$")
+
+
+def strip_media_tags(text: str | None) -> str:
+    """Drops outlet labels such as "VIDEO/", "(video)", "[FOTO]" or a trailing "| LIVE" from a headline."""
+    if not text:
+        return ""
+    t = _MEDIA_BRACKETED_RE.sub(" ", text)
+    t = _MEDIA_LEADING_RE.sub("", t.strip())
+    t = _MEDIA_TRAILING_RE.sub("", t)
+    return _WS_RE.sub(" ", t).strip()

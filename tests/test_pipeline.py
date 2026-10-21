@@ -7,11 +7,12 @@ import os
 from pathlib import Path
 
 import pytest
+from psycopg.types.json import Jsonb
 
 from newsagg.config import load_config
 from newsagg.db import Database
 from newsagg.llm import LLMError
-from newsagg.prompts import DigestLine, DigestLines, ItemLabel, ItemLabels
+from newsagg.prompts import DigestEvent, DigestLine, DigestLines, DigestPlan, ItemLabel, ItemLabels
 from newsagg.stages import Processor, Publisher, Writer
 
 DB_URL = os.environ.get("NEWSAGG_TEST_DATABASE_URL")
@@ -20,8 +21,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class FakeLLM:
-    def __init__(self, fail_labels=False):
+    def __init__(self, fail_labels=False, fail_plan=False):
         self.fail_labels = fail_labels
+        self.fail_plan = fail_plan
+        self.plan_calls = 0
 
     async def generate(self, system, user, schema, max_tokens=4000):
         import json
@@ -43,6 +46,21 @@ class FakeLLM:
                            rest=" ".join(s["title"].split()[3:]), anchor=" ".join(s["title"].split()[3:5]))
                 for s in payload
             ])
+        if schema is DigestPlan:
+            # Same event = same first word ("Putin ..."); subject = the person named in the line.
+            self.plan_calls += 1
+            if self.fail_plan:
+                raise LLMError("down")
+            groups = {}
+            for c in payload:
+                groups.setdefault(c["line"].split()[0], []).append(c["id"])
+            events = []
+            for key, ids in groups.items():
+                if key.startswith("Niculescu"):  # different happenings, same person
+                    events += [DigestEvent(ids=[i], keep=i, subject="Luca Niculescu") for i in ids]
+                else:
+                    events.append(DigestEvent(ids=ids, keep=max(ids), subject=key))
+            return DigestPlan(events=events)
         raise AssertionError(schema)
 
 
@@ -112,7 +130,7 @@ async def test_full_pipeline(env):
     assert await writer.run_once() == 0
 
     bot = FakeBot()
-    pub = Publisher(cfg, db, bot=bot)
+    pub = Publisher(cfg, db, bot=bot, llm=FakeLLM())
     digest_id = await pub.build_digest()
     assert digest_id
     review_text = bot.sent[0][1]
@@ -152,9 +170,77 @@ async def test_keyword_fallback_and_skip(env):
     assert line["template"] is True
 
     bot = FakeBot()
-    pub = Publisher(cfg, db, bot=bot)
+    pub = Publisher(cfg, db, bot=bot, llm=None)
     digest_id = await pub.build_digest()
     await pub.handle_update({"callback_query": {"id": "x", "data": f"skip:{digest_id}", "message": {"message_id": 1, "chat": {"id": 42}}}})
     assert (await db.fetchone("select status from digests"))["status"] == "skipped"
     # Skipped stories are free again for a rebuilt digest.
     assert await pub.build_digest() is not None
+
+
+async def add_story(db, section, title, source_count=1, importance=4):
+    words = title.split()
+    line = {"emoji": "💥", "lead": " ".join(words[:3]), "rest": " ".join(words[3:]), "anchor": " ".join(words[3:5])}
+    row = await db.fetchone(
+        """insert into stories (norm_title, title, url, source_id, source_count, region, section, topic,
+                                importance, status, line)
+           values (%s, %s, %s, 'digi24', %s, %s, %s, 'politics', %s, 'written', %s) returning id""",
+        (title.lower(), title, f"https://digi24.ro/{len(title)}{words[-1]}", source_count,
+         {"externe": "world"}.get(section, section), section, importance, Jsonb(line)),
+    )
+    return row["id"]
+
+
+async def seed_repetitive_day(db):
+    ids = {}
+    ids["putin1"] = await add_story(db, "externe", "Putin acceptă să reia negocierile de pace cu Ucraina și SUA", 3)
+    ids["putin2"] = await add_story(db, "externe", "Putin a acceptat reluarea negocierilor cu Ucraina din luna viitoare", 2)
+    ids["putin3"] = await add_story(db, "externe", "Putin acceptă cererea lui Trump privind negocierile", 2)
+    ids["zelenski"] = await add_story(db, "externe", "Zelenski ia în calcul înghețarea conflictului pe linia frontului", 1)
+    ids["china"] = await add_story(db, "externe", "China anunță noi tarife pentru importurile europene", 1, importance=3)
+    for n, t in enumerate([
+        "Niculescu prezintă un plan pentru siguranța elevilor și profesorilor",
+        "Niculescu anunță trei priorități pentru fondurile europene",
+        "Niculescu a fost criticat că nu a stat în capul mesei",
+    ]):
+        ids[f"nic{n}"] = await add_story(db, "romania", t, 3 - n)
+    ids["prefect"] = await add_story(db, "romania", "Prefectul Capitalei a demisionat în semn de protest", 1, importance=3)
+    return ids
+
+
+async def test_digest_keeps_one_line_per_event(env):
+    cfg, db = env
+    ids = await seed_repetitive_day(db)
+    bot, llm = FakeBot(), FakeLLM()
+    pub = Publisher(cfg, db, bot=bot, llm=llm)
+    digest_id = await pub.build_digest()
+    assert llm.plan_calls == 1
+    text = bot.sent[0][1]
+    assert text.count("Putin") == 1  # three reports of the same event -> one line
+    assert "Zelenski" in text and "China" in text
+    assert text.count("Niculescu") == 2  # max_per_subject
+    assert "Prefectul" in text
+
+    d = await db.fetchone("select story_ids from digests where id = %s", (digest_id,))
+    assert ids["putin3"] in d["story_ids"]  # the LLM's pick
+    assert ids["putin1"] not in d["story_ids"]
+    # Folded duplicates go with the digest; the third Niculescu line stays free.
+    in_digest = {r["id"] for r in await db.fetch("select id from stories where digest_id = %s", (digest_id,))}
+    assert {ids["putin1"], ids["putin2"]} <= in_digest
+    assert ids["nic2"] not in in_digest
+
+    await pub.post(digest_id)
+    posted = {r["id"] for r in await db.fetch("select id from stories where status = 'posted'")}
+    assert ids["putin1"] in posted and ids["nic2"] not in posted
+
+
+async def test_digest_falls_back_to_ranking_when_llm_fails(env):
+    cfg, db = env
+    ids = await seed_repetitive_day(db)
+    bot = FakeBot()
+    pub = Publisher(cfg, db, bot=bot, llm=FakeLLM(fail_plan=True))
+    digest_id = await pub.build_digest()
+    d = await db.fetchone("select story_ids from digests where id = %s", (digest_id,))
+    # Plain ranking: top 3 externe by score are the three Putin stories, top 4 romania.
+    assert {ids["putin1"], ids["putin2"], ids["putin3"]} <= set(d["story_ids"])
+    assert len(d["story_ids"]) == 3 + 4
