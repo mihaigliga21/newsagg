@@ -68,8 +68,10 @@ async def _digest(cfg, dry_run: bool):
     try:
         pub = Publisher(cfg, db)
         if dry_run:
-            by_section, _ = await pub.select_stories()
-            for part in pub.render(by_section):
+            sel = await pub.select_stories()
+            for note in sel.notes:
+                print(note)
+            for part in pub.render(sel.by_section):
                 print(part, end="\n\n---\n\n")
         else:
             await pub.build_digest()

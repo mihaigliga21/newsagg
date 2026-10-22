@@ -10,6 +10,12 @@ from pydantic import ValidationError
 from .base import LLMError, LLMProvider, T
 
 
+def _json_part(content: str) -> str:
+    """Some providers ignore response_format and wrap the JSON in prose or a ```json fence."""
+    start, end = content.find("{"), content.rfind("}")
+    return content[start : end + 1] if 0 <= start < end else content
+
+
 class OpenAICompatibleProvider(LLMProvider):
     def __init__(self, cfg):
         super().__init__(cfg)
@@ -32,6 +38,6 @@ class OpenAICompatibleProvider(LLMProvider):
             resp = await self.http.post("/chat/completions", json=body)
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
-            return schema.model_validate(json.loads(content))
-        except (httpx.HTTPError, KeyError, json.JSONDecodeError, ValidationError) as exc:
+            return schema.model_validate(json.loads(_json_part(content)))
+        except (httpx.HTTPError, KeyError, TypeError, json.JSONDecodeError, ValidationError) as exc:
             raise LLMError(f"openai_compatible call failed: {exc}") from exc

@@ -143,37 +143,78 @@ def test_render_line_no_space_before_punctuation():
     assert out == '💥 <b>Rusia respinge propunerile europenilor</b>, formulate <a href="https://x.md/1">la Oslo</a>, pentru negocieri'
 
 
-def _story(sid, section):
-    return {"id": sid, "section": section}
+_TITLES = [
+    "", "Guvernul aprobă bugetul pentru spitale", "Elevii protestează față de noile manuale",
+    "Ploile au inundat trei sate din nord", "Banca centrală ridică dobânda de referință",
+    "Kievul raportează un atac cu drone", "Alegeri anticipate convocate în Bulgaria",
+    "Prețul gazelor scade pe bursa europeană",
+]
 
 
-def test_apply_plan_one_line_per_event_and_subject_cap():
-    ranked = {"ro": [_story(1, "ro"), _story(2, "ro"), _story(3, "ro"), _story(4, "ro")],
-              "ext": [_story(5, "ext"), _story(6, "ext"), _story(7, "ext")]}
+def _story(sid, section, title=None):
+    return {"id": sid, "section": section, "norm_title": normalize_title(title or _TITLES[sid])}
+
+
+def _ev(ids, keep, subject, region="romania", already_sent=False):
+    return DigestEvent(ids=ids, keep=keep, subject=subject, region=region, already_sent=already_sent)
+
+
+def test_apply_plan_one_line_per_event_and_subject_cap(monkeypatch):
+    c = cfg(monkeypatch)
+    ranked = {"moldova": [], "romania": [_story(1, "romania"), _story(2, "romania"), _story(3, "romania"), _story(4, "romania")],
+              "externe": [_story(5, "externe"), _story(6, "externe"), _story(7, "externe")]}
     scores = {1: 50, 2: 49, 3: 48, 4: 10, 5: 40, 6: 39, 7: 20}
     plan = DigestPlan(events=[
-        DigestEvent(ids=[1], keep=1, subject="Luca Niculescu"),
-        DigestEvent(ids=[2], keep=2, subject=" LUCA  Niculescu"),  # same subject after normalizing
-        DigestEvent(ids=[3], keep=3, subject="luca niculescu"),
-        DigestEvent(ids=[5, 6, 99], keep=6, subject="Vladimir Putin"),  # 99 is unknown and ignored
+        _ev([1], 1, "Luca Niculescu"),
+        _ev([2], 2, " LUCA  Niculescu"),  # same subject after normalizing
+        _ev([3], 3, "luca niculescu"),
+        _ev([5, 6, 99], 6, "Vladimir Putin", "world"),  # 99 is unknown and ignored
     ])
-    chosen, folded = apply_plan(ranked, plan, {"ro": 3, "ext": 3}, 2, scores)
-    assert [s["id"] for s in chosen["ro"]] == [1, 2, 4]  # 3 is a third Niculescu line
-    assert [s["id"] for s in chosen["ext"]] == [6, 7]
-    assert folded == [5]
+    sel = apply_plan(c, ranked, plan, scores)
+    assert [s["id"] for s in sel.by_section["romania"]] == [1, 2, 4]  # 3 is a third Niculescu line
+    assert [s["id"] for s in sel.by_section["externe"]] == [6, 7]
+    assert sel.folded == [5]
 
 
-def test_apply_plan_without_plan_is_plain_ranking():
-    ranked = {"ro": [_story(1, "ro"), _story(2, "ro"), _story(3, "ro")]}
-    chosen, folded = apply_plan(ranked, None, {"ro": 2}, 2, {1: 3, 2: 2, 3: 1})
-    assert [s["id"] for s in chosen["ro"]] == [1, 2] and folded == []
+def test_apply_plan_moves_event_to_the_section_of_its_region(monkeypatch):
+    c = cfg(monkeypatch)
+    ranked = {"moldova": [_story(1, "moldova")], "romania": [_story(2, "romania")], "externe": []}
+    plan = DigestPlan(events=[_ev([1], 1, "a", "moldova"), _ev([2], 2, "b", "moldova")])
+    sel = apply_plan(c, ranked, plan, {1: 2, 2: 1})
+    assert [s["id"] for s in sel.by_section["moldova"]] == [1, 2] and sel.by_section["romania"] == []
 
 
-def test_apply_plan_bad_keep_falls_back_to_best_ranked():
-    ranked = {"ro": [_story(1, "ro"), _story(2, "ro")]}
-    plan = DigestPlan(events=[DigestEvent(ids=[2, 1], keep=42, subject="x"), DigestEvent(ids=[1], keep=1, subject="y")])
-    chosen, folded = apply_plan(ranked, plan, {"ro": 5}, 2, {1: 2, 2: 1})
-    assert [s["id"] for s in chosen["ro"]] == [1] and folded == [2]
+def test_apply_plan_skips_events_already_sent(monkeypatch):
+    c = cfg(monkeypatch)
+    ranked = {"moldova": [_story(1, "moldova", "Parlamentul a adoptat politica fiscală pentru 2027"),
+                          _story(2, "moldova", "Un elev de 14 ani a fost rănit cu un cuțit într-o școală"),
+                          _story(3, "moldova", "Stațiile de transport public vor fi mutate lângă școli")],
+              "romania": [], "externe": []}
+    plan = DigestPlan(events=[_ev([1], 1, "Parlamentul", "moldova", already_sent=True),
+                              _ev([2], 2, "Poliția", "moldova"), _ev([3], 3, "Guvernul", "moldova")])
+    sent = [normalize_title("Un elev de 14 ani a fost rănit cu un cuțit într-o școală din Chișinău")]
+    sel = apply_plan(c, ranked, plan, {1: 3, 2: 2, 3: 1}, sent)
+    assert [s["id"] for s in sel.by_section["moldova"]] == [3]  # 1 by the LLM, 2 by title
+    assert sel.repeats == 2 and sorted(sel.folded) == [1, 2]
+
+
+def test_apply_plan_without_plan_merges_similar_titles(monkeypatch):
+    c = cfg(monkeypatch)
+    ranked = {"moldova": [], "romania": [], "externe": [
+        _story(1, "externe", "Hamas amenință Israelul cu un nou atac de amploarea celui de la 7 octombrie"),
+        _story(2, "externe", "Hamas amenință Israelul cu noi atacuri, similare masacrului din 7 octombrie"),
+        _story(3, "externe", "SUA și Israelul pregătesc o nouă ofensivă împotriva Iranului"),
+    ]}
+    sel = apply_plan(c, ranked, None, {1: 3, 2: 2, 3: 1})
+    assert [s["id"] for s in sel.by_section["externe"]] == [1, 3] and sel.folded == [2]
+
+
+def test_apply_plan_bad_keep_falls_back_to_best_ranked(monkeypatch):
+    c = cfg(monkeypatch)
+    ranked = {"moldova": [], "romania": [_story(1, "romania"), _story(2, "romania")], "externe": []}
+    plan = DigestPlan(events=[_ev([2, 1], 42, "x"), _ev([1], 1, "y")])
+    sel = apply_plan(c, ranked, plan, {1: 2, 2: 1})
+    assert [s["id"] for s in sel.by_section["romania"]] == [1] and sel.folded == [2]
 
 
 async def test_openai_compatible_returns_digest_plan():
@@ -188,7 +229,8 @@ async def test_openai_compatible_returns_digest_plan():
 
     def handler(request):
         sent.update(json.loads(request.content))
-        content = json.dumps({"events": [{"ids": [1, 2], "keep": 2, "subject": "Vladimir Putin"}]})
+        event = {"ids": [1, 2], "keep": 2, "subject": "Vladimir Putin", "region": "world", "already_sent": False}
+        content = "```json\n" + json.dumps({"events": [event]}) + "\n```"  # fenced, as some models do
         return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
 
     prov = OpenAICompatibleProvider(LLMConfig(provider="openai_compatible", base_url="https://llm.test/v1", api_key="k"))
