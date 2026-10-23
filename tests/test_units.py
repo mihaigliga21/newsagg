@@ -238,6 +238,81 @@ async def test_openai_compatible_returns_digest_plan():
     plan = await prov.generate("s", "u", DigestPlan)
     assert plan.events[0].keep == 2
     assert sent["response_format"]["json_schema"]["name"] == "DigestPlan"
+    fmt = sent["response_format"]["json_schema"]
+    assert fmt["strict"] is True
+    event_schema = fmt["schema"]["$defs"]["DigestEvent"]
+    assert event_schema["additionalProperties"] is False and len(event_schema["required"]) == 5
+
+
+def _provider(replies):
+    import httpx
+
+    from newsagg.config import LLMConfig
+    from newsagg.llm.openai_compatible import OpenAICompatibleProvider
+
+    calls = []
+
+    def handler(request):
+        content, finish = replies[len(calls)]
+        calls.append(1)
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}, "finish_reason": finish}]})
+
+    prov = OpenAICompatibleProvider(LLMConfig(provider="openai_compatible", base_url="https://llm.test/v1", api_key="k"))
+    prov.http = httpx.AsyncClient(base_url="https://llm.test/v1", transport=httpx.MockTransport(handler))
+    return prov, calls
+
+
+async def test_openai_compatible_repairs_unescaped_quotes():
+    # The model closed a Romanian quote with an ASCII one, which breaks the JSON string.
+    bad = ('{"events": [{"ids": [1, 2], "keep": 2, "subject": "Partidul „Șor" interzis", '
+           '"region": "moldova", "already_sent": false}]}')
+    prov, calls = _provider([(bad, "stop")])
+    plan = await prov.generate("s", "u", DigestPlan)
+    assert plan.events[0].ids == [1, 2] and len(calls) == 1
+
+
+async def test_openai_compatible_asks_again_when_reply_does_not_fit():
+    import json
+
+    good = json.dumps({"events": [{"ids": [1], "keep": 1, "subject": "x", "region": "world", "already_sent": False}]})
+    prov, calls = _provider([("Sorry, I can't help with that.", "stop"), (good, "stop")])
+    plan = await prov.generate("s", "u", DigestPlan)
+    assert plan.events[0].keep == 1 and len(calls) == 2
+
+
+async def test_openai_compatible_drops_strict_mode_when_rejected():
+    import json
+
+    import httpx
+
+    from newsagg.config import LLMConfig
+    from newsagg.llm.openai_compatible import OpenAICompatibleProvider
+
+    bodies = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if body["response_format"]["json_schema"].get("strict"):
+            return httpx.Response(400, json={"error": "strict not supported"})
+        event = {"ids": [1], "keep": 1, "subject": "x", "region": "world", "already_sent": False}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({"events": [event]})}}]})
+
+    prov = OpenAICompatibleProvider(LLMConfig(provider="openai_compatible", base_url="https://llm.test/v1", api_key="k"))
+    prov.http = httpx.AsyncClient(base_url="https://llm.test/v1", transport=httpx.MockTransport(handler))
+    assert (await prov.generate("s", "u", DigestPlan)).events[0].keep == 1
+    await prov.generate("s", "u", DigestPlan)
+    assert len(bodies) == 3  # rejected once, then plain schema from then on
+
+
+async def test_openai_compatible_reports_truncated_reply():
+    import pytest
+
+    from newsagg.llm import LLMError
+
+    prov, _ = _provider([('{"events": [{"ids": [1', "length")])
+    with pytest.raises(LLMError, match="max_tokens"):
+        await prov.generate("s", "u", DigestPlan)
 
 
 def test_split_counts_visible_text_not_markup():
