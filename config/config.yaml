@@ -11,6 +11,7 @@ channel:
   schedule: ["0 20 * * *"]                     # daily at 20:00; add more cron lines for more digests
   lookback_hours: 24
   max_per_subject: 2                           # at most 2 lines about the same person or organisation
+  repeat_window_hours: 48                      # don't repeat events from digests sent (or awaiting review) this recently
   header: "📰 <b>Știrile zilei, {date}</b>"
 
 # Order matters: sections appear in this order in the digest.
@@ -104,6 +105,7 @@ dedupe:
   window_hours: 48
   title_similarity: 80     # 0-100; lower merges more aggressively
   min_tokens: 4
+  digest_similarity: 70    # at digest time, titles this similar count as one event (safety net for the LLM grouping)
 
 llm:
   enabled: true

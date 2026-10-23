@@ -90,6 +90,8 @@ class DigestEvent(BaseModel):
     ids: list[int] = Field(description="ids of every candidate about this same event")
     keep: int = Field(description="the one id from `ids` whose line covers the event best")
     subject: str = Field(description="the main person or organisation, e.g. 'Luca Niculescu', 'Vladimir Putin'")
+    region: str = Field(description="region id where the event happens or that it is about")
+    already_sent: bool = Field(description="true if a line in `already_sent` covers this event and there is no real new development")
 
 
 class DigestPlan(BaseModel):
@@ -97,21 +99,35 @@ class DigestPlan(BaseModel):
 
 
 def curate_system(cfg: Config) -> str:
-    return """You edit a daily Telegram news digest. You get candidate lines, already ranked best first within each section.
+    regions = "\n".join(f"- {rid}: {r.description or rid}" for rid, r in cfg.regions.items())
+    return f"""You edit a daily Telegram news digest. You get candidate lines, ranked best first within each section, and the lines already sent in recent digests.
 
-Group the candidates by real-world event. Two lines are the same event when they report the same happening, even from different outlets, angles or with different details (for example: "Putin accepts talks with Ukraine and the US" and "Kremlin: negotiations resume next month after the Witkoff meeting"; "PM X will visit Chișinău" and "PM X goes to Moldova on 27 October"). Lines that only share a person but report different happenings are different events.
+1. Group the candidates by real-world event. Be thorough: the same vote, meeting, decision, statement, attack or incident is ONE event even when outlets word it very differently or stress different details. Examples of one event each:
+   - "Parlamentul a adoptat politica fiscală pentru 2027" / "Deputații PAS au votat noua politică fiscală" / "Politica fiscală pentru 2027, votată în lectură finală"
+   - "Prima ședință CSAT cu miniștrii PSD, convocată de Nicușor Dan" / "CSAT se reunește în noul format"
+   - "Hamas amenință Israelul cu un nou atac" / "Hamas amenință Israelul cu noi atacuri, similare masacrului din 7 octombrie"
+   - "Putin acceptă să reia negocierile de pace" / "Kremlinul: negocierile se reiau luna viitoare"
+   Lines that only share a person but report different happenings are different events.
+2. For each event decide `already_sent`: true when a line in `already_sent` reports the same event, unless the candidate brings a real new development (a vote passed after a debate, a death toll that changed, a new decision). Rewording or extra detail is not a development.
+3. Decide the event's `region` from what it is about, not from the outlet: a Moldovan law reported by a Romanian site is moldova. Region ids:
+{regions}
 
 For each event return:
-- ids: every candidate id about it (a candidate belongs to exactly one event)
-- keep: the id whose line is most informative and specific; prefer earlier (higher ranked) ids when they are equally good
-- subject: the main person or organisation the event is about, written the same way every time it recurs (for example always "Luca Niculescu", not sometimes "Premierul Niculescu")
+- ids: every candidate id about it (each candidate belongs to exactly one event)
+- keep: the id whose line is most informative and specific; prefer higher ranked ids when they are equally good
+- subject: the main person or organisation, written the same way every time it recurs (always "Luca Niculescu", never sometimes "Premierul Niculescu")
+- region: one of the region ids above
+- already_sent: as above
 
 Every candidate id must appear in exactly one event. Do not rewrite the lines."""
 
 
-def curate_user(candidates: list[dict]) -> str:
-    payload = [
-        {"id": c["id"], "section": c["section"], "line": c["text"]}
-        for c in candidates
-    ]
+def curate_user(candidates: list[dict], already_sent: list[str] | None = None) -> str:
+    payload = {
+        "candidates": [
+            {"id": c["id"], "section": c["section"], "title": c.get("title", ""), "line": c["text"]}
+            for c in candidates
+        ],
+        "already_sent": already_sent or [],
+    }
     return "Group these candidates:\n" + json.dumps(payload, ensure_ascii=False)

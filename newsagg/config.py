@@ -33,6 +33,7 @@ class ChannelConfig(BaseModel):
     header: str | None = "📰 <b>Știrile zilei, {date}</b>"
     lookback_hours: int = 24
     max_per_subject: int = 2  # at most this many lines about the same person or organisation
+    repeat_window_hours: int = 48  # events in digests sent (or waiting for review) this recently are not repeated
 
 
 class SectionConfig(BaseModel):
@@ -88,6 +89,7 @@ class FilterConfig(BaseModel):
 class DedupeConfig(BaseModel):
     window_hours: int = 48
     title_similarity: int = 85
+    digest_similarity: int = 70  # at digest time, titles this similar count as one event
     min_tokens: int = 4
 
 

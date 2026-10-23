@@ -13,7 +13,7 @@ Four services, one Docker image. They only talk through Postgres (Supabase). Eac
 | `collector` | sources in `config/config.yaml`, each on its own interval | `raw_items` (status `new`) |
 | `processor` | `raw_items` with status `new` | labels region, topic and importance (LLM, keyword fallback), rejects ads and off-region items, merges duplicates into `stories` |
 | `writer` | `stories` with status `pending_write` | the line (emoji, bold lead, sentence, link anchor) in `stories.line` |
-| `publisher` | `stories` with status `written`, on the cron in `channel.schedule` | keeps one line per event (LLM grouping, plain ranking as fallback), builds the digest, sends it to your review chat with ✅ / ❌ buttons, posts it to the channel on ✅ |
+| `publisher` | `stories` with status `written`, on the cron in `channel.schedule` | keeps one line per event and drops events already sent (LLM grouping plus a title-similarity check; the review chat warns when the LLM step failed), builds the digest, sends it to your review chat with ✅ / ❌ buttons, posts it to the channel on ✅ |
 
 In the review chat, `/digest` builds a digest right away and `/status` shows counts for the last 24 hours and failing sources.
 
@@ -47,6 +47,7 @@ Everything is in `config/config.yaml`:
 - **sources**: `rss`, `website` (listing page + CSS selector for article links) or `telegram` (public channel through `t.me/s/<channel>`). `priority` decides which outlet gets the link when several cover the same story (lower is better). Feeds marked `checked` returned valid RSS when this was written; the others are disabled until you check them with `test-source`.
 - **regions** and **sections**: which regions exist and which section of the digest each goes into, and how many lines each section gets (`max_items`; the default 6/4/3 fits one Telegram message). Descriptions guide the LLM; keywords are the fallback.
 - **channel.max_per_subject**: at most this many lines about the same person or organisation (default 2).
+- **channel.repeat_window_hours**: events that were in a digest posted or waiting for review within this many hours are not repeated (default 48). A digest is never padded: on a quiet evening it is shorter, or not sent, and the review chat says how many repeats were left out.
 - **topics**: the emoji per topic.
 - **filter.blocklist**: words that drop an item before anything else (horoscopes, ads).
 - **dedupe**: time window and title similarity threshold for merging stories.

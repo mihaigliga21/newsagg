@@ -14,6 +14,7 @@ from newsagg.db import Database
 from newsagg.llm import LLMError
 from newsagg.prompts import DigestEvent, DigestLine, DigestLines, DigestPlan, ItemLabel, ItemLabels
 from newsagg.stages import Processor, Publisher, Writer
+from newsagg.textutil import normalize_title
 
 DB_URL = os.environ.get("NEWSAGG_TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not DB_URL, reason="NEWSAGG_TEST_DATABASE_URL not set")
@@ -51,15 +52,21 @@ class FakeLLM:
             self.plan_calls += 1
             if self.fail_plan:
                 raise LLMError("down")
-            groups = {}
-            for c in payload:
+            self.sent = payload["already_sent"]
+            groups, sections = {}, {}
+            for c in payload["candidates"]:
                 groups.setdefault(c["line"].split()[0], []).append(c["id"])
+                sections[c["id"]] = c["section"]
+            region = lambda i: {"externe": "world"}.get(sections[i], sections[i])
+            sent_keys = {line.split()[0] for line in self.sent}
             events = []
             for key, ids in groups.items():
                 if key.startswith("Niculescu"):  # different happenings, same person
-                    events += [DigestEvent(ids=[i], keep=i, subject="Luca Niculescu") for i in ids]
+                    events += [DigestEvent(ids=[i], keep=i, subject="Luca Niculescu", region=region(i),
+                                           already_sent=False) for i in ids]
                 else:
-                    events.append(DigestEvent(ids=ids, keep=max(ids), subject=key))
+                    events.append(DigestEvent(ids=ids, keep=max(ids), subject=key, region=region(ids[0]),
+                                              already_sent=key in sent_keys))
             return DigestPlan(events=events)
         raise AssertionError(schema)
 
@@ -185,7 +192,7 @@ async def add_story(db, section, title, source_count=1, importance=4):
         """insert into stories (norm_title, title, url, source_id, source_count, region, section, topic,
                                 importance, status, line)
            values (%s, %s, %s, 'digi24', %s, %s, %s, 'politics', %s, 'written', %s) returning id""",
-        (title.lower(), title, f"https://digi24.ro/{len(title)}{words[-1]}", source_count,
+        (normalize_title(title), title, f"https://digi24.ro/{len(title)}{words[-1]}", source_count,
          {"externe": "world"}.get(section, section), section, importance, Jsonb(line)),
     )
     return row["id"]
@@ -241,6 +248,47 @@ async def test_digest_falls_back_to_ranking_when_llm_fails(env):
     pub = Publisher(cfg, db, bot=bot, llm=FakeLLM(fail_plan=True))
     digest_id = await pub.build_digest()
     d = await db.fetchone("select story_ids from digests where id = %s", (digest_id,))
-    # Plain ranking: top 3 externe by score are the three Putin stories, top 4 romania.
-    assert {ids["putin1"], ids["putin2"], ids["putin3"]} <= set(d["story_ids"])
-    assert len(d["story_ids"]) == 3 + 4
+    # Plain ranking, with near-identical titles still merged: one Putin line, then the rest by score.
+    assert ids["putin1"] in d["story_ids"]
+    assert ids["putin2"] not in d["story_ids"] and ids["putin3"] not in d["story_ids"]
+    assert {ids["zelenski"], ids["china"]} <= set(d["story_ids"])
+    assert len([i for i in d["story_ids"] if i in {ids[f"nic{n}"] for n in range(3)}]) == 3  # no subjects without the LLM
+
+
+async def test_next_digest_does_not_repeat_events(env):
+    cfg, db = env
+    ids = await seed_repetitive_day(db)
+    bot, llm = FakeBot(), FakeLLM()
+    pub = Publisher(cfg, db, bot=bot, llm=llm)
+    first = await pub.build_digest()
+    await pub.post(first)
+
+    # Two hours later: a new report of the Putin event and one genuinely new story.
+    putin4 = await add_story(db, "externe", "Putin confirmă reluarea negocierilor după întâlnirea cu Witkoff", 2)
+    iran = await add_story(db, "externe", "Iranul răspunde la amenințările SUA și ale Israelului", 1)
+    bot.sent.clear()
+    second = await pub.build_digest()
+    assert any(line.startswith("Putin") for line in llm.sent)
+    d = await db.fetchone("select story_ids from digests where id = %s", (second,))
+    assert iran in d["story_ids"] and putin4 not in d["story_ids"]
+    assert ids["nic2"] in d["story_ids"]  # left over from the first digest, not a repeat
+    assert "Am omis 1 știri deja trimise" in bot.sent[-1][1]
+
+
+async def test_quiet_hour_sends_no_digest(env):
+    cfg, db = env
+    await add_story(db, "externe", "Hamas amenință Israelul cu un nou atac de amploarea celui de la 7 octombrie", 2)
+    bot = FakeBot()
+    pub = Publisher(cfg, db, bot=bot, llm=None)
+    await pub.post(await pub.build_digest())
+    await add_story(db, "externe", "Hamas amenință Israelul cu noi atacuri, similare masacrului din 7 octombrie", 2)
+    assert await pub.build_digest() is None
+    assert bot.sent[-1][1].startswith("Nu sunt știri noi pentru digest.\nAm omis 1")
+
+
+async def test_grouping_failure_is_shown_in_review(env):
+    cfg, db = env
+    await seed_repetitive_day(db)
+    bot = FakeBot()
+    await Publisher(cfg, db, bot=bot, llm=FakeLLM(fail_plan=True)).build_digest()
+    assert "⚠️ Gruparea pe evenimente a eșuat (down)" in bot.sent[-1][1]
