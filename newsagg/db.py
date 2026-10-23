@@ -2,6 +2,10 @@
 
 On Supabase use the *session pooler* or direct connection string (port 5432).
 The transaction pooler (port 6543) does not support LISTEN.
+
+The server can close a pooled connection at any time (Supabase/Supavisor recycling idle
+sessions, maintenance restarts), so the pool checks a connection before handing it out and
+single statements are retried on a fresh connection when the connection fails.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from psycopg_pool import AsyncConnectionPool
 log = logging.getLogger(__name__)
 
 SCHEMA_FILE = Path(__file__).with_name("schema.sql")
+RETRY_DELAYS = (1, 5)  # seconds to wait before each retry of a statement whose connection failed
 
 
 def _configure(conn: psycopg.AsyncConnection):
@@ -38,6 +43,7 @@ class Database:
             open=False,
             kwargs={"row_factory": dict_row, "prepare_threshold": None},
             configure=_configure,
+            check=AsyncConnectionPool.check_connection,  # drop connections the server closed while idle
         )
 
     async def open(self):
@@ -52,20 +58,30 @@ class Database:
             async with conn.transaction():
                 yield conn
 
+    async def _run(self, sql: str, params, result):
+        """Runs one statement in its own transaction. A failed connection rolls the transaction
+        back, so the statement can safely run again on a new connection."""
+        for delay in (*RETRY_DELAYS, None):
+            async with self.pool.connection() as conn:
+                try:
+                    return await result(await conn.execute(sql, params))
+                except psycopg.OperationalError as exc:
+                    if delay is None or not conn.broken:
+                        raise
+                    log.warning("database connection lost (%s); retrying in %ss", exc, delay)
+            await asyncio.sleep(delay)
+
     async def fetch(self, sql: str, params=None) -> list[dict]:
-        async with self.pool.connection() as conn:
-            cur = await conn.execute(sql, params)
-            return await cur.fetchall()
+        return await self._run(sql, params, lambda cur: cur.fetchall())
 
     async def fetchone(self, sql: str, params=None) -> dict | None:
-        async with self.pool.connection() as conn:
-            cur = await conn.execute(sql, params)
-            return await cur.fetchone()
+        return await self._run(sql, params, lambda cur: cur.fetchone())
 
     async def execute(self, sql: str, params=None) -> int:
-        async with self.pool.connection() as conn:
-            cur = await conn.execute(sql, params)
+        async def rowcount(cur):
             return cur.rowcount
+
+        return await self._run(sql, params, rowcount)
 
     async def migrate(self, attempts: int = 12):
         sql = SCHEMA_FILE.read_text(encoding="utf-8")

@@ -292,3 +292,75 @@ async def test_grouping_failure_is_shown_in_review(env):
     bot = FakeBot()
     await Publisher(cfg, db, bot=bot, llm=FakeLLM(fail_plan=True)).build_digest()
     assert "⚠️ Gruparea pe evenimente a eșuat (down)" in bot.sent[-1][1]
+
+
+async def kill_pool_connections(db):
+    """What Supabase/Supavisor does to idle sessions: the server ends them (AdminShutdown)."""
+    async with await __import__("psycopg").AsyncConnection.connect(DB_URL, autocommit=True) as c:
+        await c.execute(
+            "select pg_terminate_backend(pid) from pg_stat_activity "
+            "where datname = current_database() and pid <> pg_backend_pid()"
+        )
+
+
+async def test_queries_survive_server_closing_idle_connections(env):
+    cfg, db = env
+    await add_story(db, "externe", "Hamas amenință Israelul cu un nou atac", 2)
+    await kill_pool_connections(db)
+    assert await db.fetchone("select count(*) n from stories") == {"n": 1}
+    # A connection that dies between the pool check and the query is retried too.
+    async with db.pool.connection() as conn:
+        pid = conn.info.backend_pid
+    db.pool._check = None  # skip the pool check so the query hits the dead connection
+    async with await __import__("psycopg").AsyncConnection.connect(DB_URL, autocommit=True) as c:
+        await c.execute("select pg_terminate_backend(%s)", (pid,))
+    assert await db.fetchone("select count(*) n from stories") == {"n": 1}
+
+
+async def test_scheduled_digest_retries_until_the_database_is_back(env):
+    cfg, db = env
+    await add_story(db, "externe", "Hamas amenință Israelul cu un nou atac", 2)
+    bot = FakeBot()
+    pub = Publisher(cfg, db, bot=bot, llm=None)
+    pub.retry_delays = (0, 0)
+    real, calls = pub.select_stories, []
+
+    async def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise __import__("psycopg").errors.AdminShutdown("terminating connection due to administrator command")
+        return await real()
+
+    pub.select_stories = flaky
+    await pub.scheduled_digest()
+    assert len(calls) == 3
+    assert (await db.fetchone("select count(*) n from digests"))["n"] == 1
+
+
+async def test_scheduled_digest_reports_when_retries_run_out(env):
+    cfg, db = env
+    bot = FakeBot()
+    pub = Publisher(cfg, db, bot=bot, llm=None)
+    pub.retry_delays = (0,)
+
+    async def down():
+        raise __import__("psycopg").OperationalError("server closed the connection")
+
+    pub.select_stories = down
+    await pub.scheduled_digest()
+    assert bot.sent[-1][1].startswith("⚠️ Digestul programat nu a putut fi construit")
+
+
+async def test_scheduled_digest_is_not_rebuilt_after_it_was_saved(env):
+    cfg, db = env
+    await add_story(db, "externe", "Hamas amenință Israelul cu un nou atac", 2)
+    bot = FakeBot()
+    pub = Publisher(cfg, db, bot=bot, llm=None)
+    pub.retry_delays = (0, 0)
+
+    async def telegram_down(*a, **k):
+        raise RuntimeError("telegram down")
+
+    pub.send_for_review = telegram_down
+    await pub.scheduled_digest()
+    assert (await db.fetchone("select count(*) n from digests"))["n"] == 1

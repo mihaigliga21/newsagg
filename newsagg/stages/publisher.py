@@ -28,6 +28,7 @@ from ..textutil import normalize_title
 from .base import DEFAULT, Stage
 
 CANDIDATES_PER_SLOT = 3  # how many ranked candidates per section slot the LLM sees
+RETRY_DELAYS = (30, 120, 300, 600)  # seconds before each new try of a scheduled digest that failed
 
 
 def score(story: dict, now: datetime) -> float:
@@ -133,6 +134,7 @@ def apply_plan(
 
 class Publisher(Stage):
     name = "publisher"
+    retry_delays = RETRY_DELAYS
 
     def __init__(self, cfg, db, bot: TelegramBot | None = None, llm=DEFAULT):
         super().__init__(cfg, db)
@@ -142,6 +144,7 @@ class Publisher(Stage):
         self.bot = bot or TelegramBot(cfg.channel.bot_token)
         self.tz = ZoneInfo(cfg.channel.timezone)
         self.review_chat = cfg.channel.review_chat_id
+        self.built_id: int | None = None  # set as soon as build_digest has saved a digest
 
     # ---------- building ----------
 
@@ -229,6 +232,7 @@ class Publisher(Stage):
             await conn.execute(
                 "update stories set digest_id = %s where id = any(%s)", (digest_id, story_ids + folded)
             )
+        self.built_id = digest_id
         self.log.info("digest %d built with %d stories in %d parts", digest_id, len(story_ids), len(parts))
 
         if self.review_chat:
@@ -286,10 +290,39 @@ class Publisher(Stage):
             nxt = min(croniter(expr, now).get_next(datetime) for expr in self.cfg.channel.schedule)
             self.log.info("next digest at %s", nxt.isoformat())
             await asyncio.sleep(max(1.0, (nxt - datetime.now(self.tz)).total_seconds()))
+            await self.scheduled_digest()
+
+    async def scheduled_digest(self):
+        """Builds the digest, trying again a few times if it fails before a digest is saved
+        (database or Telegram briefly unreachable), so a slot is not lost to a short outage."""
+        for attempt, delay in enumerate((*self.retry_delays, None), 1):
+            self.built_id = None
             try:
                 await self.build_digest()
-            except Exception:
-                self.log.exception("building digest failed")
+                return
+            except Exception as exc:
+                if self.built_id is not None:  # saved; retrying would build a second digest
+                    self.log.exception("digest %d was saved but sending it failed", self.built_id)
+                    return
+                if delay is None:
+                    self.log.exception("building digest failed after %d attempts", attempt)
+                    await self.report_failure(exc)
+                    return
+                self.log.warning("building digest failed (%s: %s); retrying in %ds",
+                                 type(exc).__name__, exc, delay)
+                await asyncio.sleep(delay)
+
+    async def report_failure(self, exc: Exception):
+        if not self.review_chat:
+            return
+        try:
+            await self.bot.send_message(
+                self.review_chat,
+                f"⚠️ Digestul programat nu a putut fi construit ({html.escape(str(exc)[:200])}). "
+                "Trimite /digest pentru a încerca din nou.",
+            )
+        except Exception as send_exc:
+            self.log.warning("could not report the failure to the review chat: %s", send_exc)
 
     async def updates_loop(self):
         offset = await self.db.kv_get("telegram_offset")
