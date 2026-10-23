@@ -17,6 +17,8 @@ Four services, one Docker image. They only talk through Postgres (Supabase). Eac
 
 In the review chat, `/digest` builds a digest right away and `/status` shows counts for the last 24 hours and failing sources.
 
+If a scheduled digest fails (after a few retries) or its slot passes while the publisher is down, the next start catches it up: all of today's missed slots become one digest, and earlier days are dropped. If the next slot is less than 30 minutes away, that slot covers them instead.
+
 ## Setup
 
 1. **Supabase:** create a project. Copy the *Session pooler* connection string (port 5432) from Project Settings > Database. The transaction pooler (port 6543) does not support `LISTEN`.

@@ -292,3 +292,143 @@ async def test_grouping_failure_is_shown_in_review(env):
     bot = FakeBot()
     await Publisher(cfg, db, bot=bot, llm=FakeLLM(fail_plan=True)).build_digest()
     assert "⚠️ Gruparea pe evenimente a eșuat (down)" in bot.sent[-1][1]
+
+
+async def kill_pool_connections(db):
+    """What Supabase/Supavisor does to idle sessions: the server ends them (AdminShutdown)."""
+    async with await __import__("psycopg").AsyncConnection.connect(DB_URL, autocommit=True) as c:
+        await c.execute(
+            "select pg_terminate_backend(pid) from pg_stat_activity "
+            "where datname = current_database() and pid <> pg_backend_pid()"
+        )
+
+
+async def test_queries_survive_server_closing_idle_connections(env):
+    cfg, db = env
+    await add_story(db, "externe", "Hamas amenință Israelul cu un nou atac", 2)
+    await kill_pool_connections(db)
+    assert await db.fetchone("select count(*) n from stories") == {"n": 1}
+    # A connection that dies between the pool check and the query is retried too.
+    async with db.pool.connection() as conn:
+        pid = conn.info.backend_pid
+    db.pool._check = None  # skip the pool check so the query hits the dead connection
+    async with await __import__("psycopg").AsyncConnection.connect(DB_URL, autocommit=True) as c:
+        await c.execute("select pg_terminate_backend(%s)", (pid,))
+    assert await db.fetchone("select count(*) n from stories") == {"n": 1}
+
+
+async def test_scheduled_digest_retries_until_the_database_is_back(env):
+    cfg, db = env
+    await add_story(db, "externe", "Hamas amenință Israelul cu un nou atac", 2)
+    bot = FakeBot()
+    pub = Publisher(cfg, db, bot=bot, llm=None)
+    pub.retry_delays = (0, 0)
+    real, calls = pub.select_stories, []
+
+    async def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise __import__("psycopg").errors.AdminShutdown("terminating connection due to administrator command")
+        return await real()
+
+    pub.select_stories = flaky
+    await pub.scheduled_digest(pub.now())
+    assert len(calls) == 3
+    assert (await db.fetchone("select count(*) n from digests"))["n"] == 1
+
+
+async def test_scheduled_digest_reports_when_retries_run_out(env):
+    cfg, db = env
+    bot = FakeBot()
+    pub = Publisher(cfg, db, bot=bot, llm=None)
+    pub.retry_delays = (0,)
+
+    async def down():
+        raise __import__("psycopg").OperationalError("server closed the connection")
+
+    pub.select_stories = down
+    await pub.scheduled_digest(pub.now())
+    assert bot.sent[-1][1].startswith("⚠️ Digestul programat nu a putut fi construit")
+
+
+async def test_scheduled_digest_is_not_rebuilt_after_it_was_saved(env):
+    cfg, db = env
+    await add_story(db, "externe", "Hamas amenință Israelul cu un nou atac", 2)
+    bot = FakeBot()
+    pub = Publisher(cfg, db, bot=bot, llm=None)
+    pub.retry_delays = (0, 0)
+
+    async def telegram_down(*a, **k):
+        raise RuntimeError("telegram down")
+
+    pub.send_for_review = telegram_down
+    await pub.scheduled_digest(pub.now())
+    assert (await db.fetchone("select count(*) n from digests"))["n"] == 1
+
+
+def scheduled_publisher(cfg, db, now, bot=None):
+    """A publisher with digests at 09:00, 12:00 and 17:00 and a fixed clock."""
+    from datetime import datetime as dt
+
+    cfg.channel.schedule = ["0 9 * * *", "0 12 * * *", "0 17 * * *"]
+    pub = Publisher(cfg, db, bot=bot or FakeBot(), llm=None)
+    pub.retry_delays = ()
+    pub.now = lambda: dt.fromisoformat(now).astimezone(pub.tz)
+    return pub
+
+
+async def digest_count(db):
+    return (await db.fetchone("select count(*) n from digests"))["n"]
+
+
+async def test_restart_catches_up_todays_missed_slots_in_one_digest(env):
+    cfg, db = env
+    await add_story(db, "externe", "Hamas amenință Israelul cu un nou atac", 2)
+    pub = scheduled_publisher(cfg, db, "2026-10-23T18:00:00+03:00")
+    await db.kv_set("digest_last_slot", "2026-10-21T17:00:00+03:00")  # yesterday's slots are dropped
+    await pub.catch_up()
+    assert await digest_count(db) == 1
+    assert "Include și digestele ratate de la 09:00, 12:00, 17:00." in pub.bot.sent[-1][1]
+    assert await db.kv_get("digest_last_slot") == "2026-10-23T17:00:00+03:00"
+    await pub.catch_up()  # cleared: a second restart builds nothing
+    assert await digest_count(db) == 1
+
+
+async def test_restart_leaves_missed_slot_to_a_close_next_slot(env):
+    cfg, db = env
+    await add_story(db, "externe", "Hamas amenință Israelul cu un nou atac", 2)
+    pub = scheduled_publisher(cfg, db, "2026-10-23T16:45:00+03:00")
+    await db.kv_set("digest_last_slot", "2026-10-23T09:00:00+03:00")
+    await pub.catch_up()
+    assert await digest_count(db) == 0
+    await pub.scheduled_digest(pub.next_slot(pub.now()))  # the 17:00 digest covers 12:00
+    assert "Include și digestul ratat de la 12:00." in pub.bot.sent[-1][1]
+    assert await db.kv_get("digest_last_slot") == "2026-10-23T17:00:00+03:00"
+
+
+async def test_first_start_uses_newest_digest_to_find_missed_slots(env):
+    cfg, db = env
+    pub = scheduled_publisher(cfg, db, "2026-10-23T13:00:00+03:00")
+    await pub.catch_up()  # never a digest: nothing to catch up, just start counting
+    assert await digest_count(db) == 0
+    assert await db.kv_get("digest_last_slot") == "2026-10-23T12:00:00+03:00"
+
+    await db.execute("delete from kv where key = 'digest_last_slot'")
+    await db.execute("insert into digests (created_at, status, parts, story_ids) "
+                     "values ('2026-10-23T09:00:05+03:00', 'posted', '[]', '{}')")
+    await add_story(db, "externe", "Hamas amenință Israelul cu un nou atac", 2)
+    await pub.catch_up()
+    assert "Include și digestul ratat de la 12:00." in pub.bot.sent[-1][1]
+
+
+async def test_failed_slot_stays_missed(env):
+    cfg, db = env
+    pub = scheduled_publisher(cfg, db, "2026-10-23T12:00:00+03:00")
+    await db.kv_set("digest_last_slot", "2026-10-23T09:00:00+03:00")
+
+    async def down():
+        raise __import__("psycopg").OperationalError("server closed the connection")
+
+    pub.select_stories = down
+    await pub.scheduled_digest(pub.now())
+    assert await db.kv_get("digest_last_slot") == "2026-10-23T09:00:00+03:00"

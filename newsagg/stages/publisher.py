@@ -5,6 +5,10 @@ Picking: stories are ranked by `score`; then an LLM groups the top candidates by
 so each event gets one line, and no person or organisation fills more than `max_per_subject` lines.
 If the LLM is off or fails, the plain ranking is used.
 
+Missed slots: the last schedule slot that got a digest is kept in kv (`digest_last_slot`). A slot
+that failed, or passed while the publisher was down, is caught up at the next start (or by the next
+slot). Several missed slots from the same day become one digest; slots from earlier days are dropped.
+
 Review chat commands: /digest builds a digest now, /status shows pipeline counts.
 """
 
@@ -13,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import html
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
@@ -28,6 +32,9 @@ from ..textutil import normalize_title
 from .base import DEFAULT, Stage
 
 CANDIDATES_PER_SLOT = 3  # how many ranked candidates per section slot the LLM sees
+RETRY_DELAYS = (30, 120, 300, 600)  # seconds before each new try of a scheduled digest that failed
+CATCH_UP_GAP = timedelta(minutes=30)  # at start, don't catch up if the next slot is this close
+LAST_SLOT_KEY = "digest_last_slot"
 
 
 def score(story: dict, now: datetime) -> float:
@@ -133,6 +140,7 @@ def apply_plan(
 
 class Publisher(Stage):
     name = "publisher"
+    retry_delays = RETRY_DELAYS
 
     def __init__(self, cfg, db, bot: TelegramBot | None = None, llm=DEFAULT):
         super().__init__(cfg, db)
@@ -142,6 +150,7 @@ class Publisher(Stage):
         self.bot = bot or TelegramBot(cfg.channel.bot_token)
         self.tz = ZoneInfo(cfg.channel.timezone)
         self.review_chat = cfg.channel.review_chat_id
+        self.built_id: int | None = None  # set as soon as build_digest has saved a digest
 
     # ---------- building ----------
 
@@ -206,10 +215,10 @@ class Publisher(Stage):
         ]
         return render_digest(sections, header)
 
-    async def build_digest(self) -> int | None:
+    async def build_digest(self, extra_notes: list[str] = ()) -> int | None:
         sel = await self.select_stories()
         story_ids = [s["id"] for lst in sel.by_section.values() for s in lst]
-        notes = sel.notes + ([f"Am omis {sel.repeats} știri deja trimise în ultimele "
+        notes = [*extra_notes, *sel.notes] + ([f"Am omis {sel.repeats} știri deja trimise în ultimele "
                               f"{self.cfg.channel.repeat_window_hours} de ore."] if sel.repeats else [])
         if not story_ids:
             self.log.info("no stories for a digest")
@@ -229,6 +238,7 @@ class Publisher(Stage):
             await conn.execute(
                 "update stories set digest_id = %s where id = any(%s)", (digest_id, story_ids + folded)
             )
+        self.built_id = digest_id
         self.log.info("digest %d built with %d stories in %d parts", digest_id, len(story_ids), len(parts))
 
         if self.review_chat:
@@ -280,16 +290,113 @@ class Publisher(Stage):
 
     # ---------- loops ----------
 
+    # ---------- schedule ----------
+
+    def now(self) -> datetime:
+        return datetime.now(self.tz)
+
+    def next_slot(self, after: datetime) -> datetime:
+        return min(croniter(expr, after).get_next(datetime) for expr in self.cfg.channel.schedule)
+
+    def slots_between(self, start: datetime, end: datetime) -> list[datetime]:
+        """Schedule slots in (start, end], oldest first."""
+        slots, t = [], start
+        while (t := self.next_slot(t)) <= end:
+            slots.append(t)
+        return slots
+
+    async def last_slot(self) -> datetime | None:
+        """The last slot that got a digest. Before the first slot is recorded, the slot before the
+        newest digest stands in for it; None if there has never been a digest."""
+        raw = await self.db.kv_get(LAST_SLOT_KEY)
+        if raw:
+            return datetime.fromisoformat(raw).astimezone(self.tz)
+        row = await self.db.fetchone("select max(created_at) t from digests")
+        if not row or not row["t"]:
+            return None
+        newest = row["t"].astimezone(self.tz)
+        return max(croniter(expr, newest).get_prev(datetime) for expr in self.cfg.channel.schedule)
+
+    async def mark_slot_done(self, slot: datetime):
+        try:
+            last = await self.last_slot()
+            if not last or slot > last:
+                await self.db.kv_set(LAST_SLOT_KEY, slot.isoformat())
+        except Exception as exc:  # worst case the slot is caught up again at the next start
+            self.log.warning("could not record digest slot %s: %s", slot.isoformat(), exc)
+
+    async def missed_slots(self, before: datetime) -> list[datetime]:
+        """Slots after the last one that got a digest and before `before`, from `before`'s day only."""
+        last = await self.last_slot()
+        if last is None:
+            return []
+        return [t for t in self.slots_between(last, before - timedelta(seconds=1)) if t.date() == before.date()]
+
+    async def catch_up(self):
+        """At start: build one digest for the slots missed today, unless the next slot is close
+        (it will include the same stories)."""
+        now = self.now()
+        if await self.last_slot() is None:  # first run: nothing to catch up
+            if prev := self.slots_between(now - timedelta(days=1), now):
+                await self.mark_slot_done(prev[-1])
+            return
+        missed = await self.missed_slots(now + timedelta(seconds=1))
+        if not missed:
+            return
+        if self.next_slot(now) - now < CATCH_UP_GAP:
+            self.log.info("missed digest slots %s; the next slot covers them", _times(missed))
+            return
+        self.log.warning("catching up missed digest slots %s", _times(missed))
+        await self.scheduled_digest(missed[-1], late=True)
+
     async def schedule_loop(self):
+        try:
+            await self.catch_up()
+        except Exception:
+            self.log.exception("catching up missed digests failed")
         while True:
-            now = datetime.now(self.tz)
-            nxt = min(croniter(expr, now).get_next(datetime) for expr in self.cfg.channel.schedule)
+            nxt = self.next_slot(self.now())
             self.log.info("next digest at %s", nxt.isoformat())
-            await asyncio.sleep(max(1.0, (nxt - datetime.now(self.tz)).total_seconds()))
+            await asyncio.sleep(max(1.0, (nxt - self.now()).total_seconds()))
+            await self.scheduled_digest(nxt)
+
+    async def scheduled_digest(self, slot: datetime, late: bool = False):
+        """Builds the digest for `slot`, trying again a few times if it fails before a digest is
+        saved (database or Telegram briefly unreachable), so a slot is not lost to a short outage.
+        Earlier slots of the same day that failed are covered by this digest too; `late` marks a
+        digest built after its slot (catching up at start)."""
+        for attempt, delay in enumerate((*self.retry_delays, None), 1):
+            self.built_id = None
             try:
-                await self.build_digest()
-            except Exception:
-                self.log.exception("building digest failed")
+                missed = await self.missed_slots(slot) + ([slot] if late else [])
+                await self.build_digest([_missed_note(missed)] if missed else [])
+            except Exception as exc:
+                if self.built_id is None and delay is not None:
+                    self.log.warning("building digest failed (%s: %s); retrying in %ds",
+                                     type(exc).__name__, exc, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                if self.built_id is None:  # the slot stays missed: the next start or slot catches it up
+                    self.log.exception("building digest failed after %d attempts", attempt)
+                    await self.report_failure(exc)
+                    return
+                # Saved; retrying would build a second digest.
+                self.log.exception("digest %d was saved but sending it failed", self.built_id)
+            await self.mark_slot_done(slot)
+            return
+
+    async def report_failure(self, exc: Exception):
+        if not self.review_chat:
+            return
+        try:
+            await self.bot.send_message(
+                self.review_chat,
+                f"⚠️ Digestul programat nu a putut fi construit ({html.escape(str(exc)[:200])}). "
+                "Va fi recuperat la următoarea pornire sau inclus în următorul digest; "
+                "trimite /digest pentru a încerca acum.",
+            )
+        except Exception as send_exc:
+            self.log.warning("could not report the failure to the review chat: %s", send_exc)
 
     async def updates_loop(self):
         offset = await self.db.kv_get("telegram_offset")
@@ -334,6 +441,10 @@ class Publisher(Stage):
             text = (msg.get("text") or "").strip().split("@")[0]
             if text == "/digest":
                 await self.build_digest()
+                # A digest built by hand also covers the slots that failed before it.
+                now = self.now()
+                if passed := self.slots_between(now - timedelta(days=1), now):
+                    await self.mark_slot_done(passed[-1])
             elif text == "/status":
                 await self.bot.send_message(self.review_chat, await self.status_text())
 
@@ -359,3 +470,13 @@ class Publisher(Stage):
         if self.review_chat:
             tasks.append(asyncio.create_task(self.updates_loop()))
         await asyncio.gather(*tasks)
+
+
+def _times(slots: list[datetime]) -> str:
+    return ", ".join(t.strftime("%H:%M") for t in slots)
+
+
+def _missed_note(slots: list[datetime]) -> str:
+    if len(slots) == 1:
+        return f"Include și digestul ratat de la {_times(slots)}."
+    return f"Include și digestele ratate de la {_times(slots)}."
