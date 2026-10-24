@@ -72,25 +72,39 @@ sources:
   - {id: newsmaker,    type: rss, name: NewsMaker,       url: "https://newsmaker.md/ro/feed/",   region: moldova, priority: 1}  # checked
   - {id: tv8,          type: rss, name: TV8,             url: "https://tv8.md/feed",             region: moldova, priority: 2}  # checked
   - {id: unimedia,     type: rss, name: Unimedia,        url: "https://unimedia.info/ro/rss/all/", region: moldova, priority: 2}  # checked
-  - {id: point,        type: rss, name: Point.md,        url: "https://point.md/ro/rss",         region: moldova, priority: 3}  # checked
-  - {id: realitatea_md, type: rss, name: Realitatea.md,  url: "https://realitatea.md/feed/",     region: moldova, priority: 3}  # checked
+  - {id: moldova1,     type: rss, name: Moldova 1,       url: "https://moldova1.md/rss",         region: moldova, priority: 1}  # checked 2026-10-24
+  - {id: protv_md,     type: rss, name: PRO TV Chișinău, url: "https://protv.md/rss",            region: moldova, priority: 2}  # checked 2026-10-24
+  - {id: moldpres,     type: rss, name: Moldpres,        url: "https://moldpres.md/config/rss.php?lang=rom", region: moldova, priority: 3}  # checked 2026-10-24; state news agency
+  # Europa Liberă Moldova has no all-news feed, only sections; not checked (robots block the fetch tool)
+  - {id: rel_md_politica, type: rss, name: Europa Liberă, url: "https://www.europalibera.md/api/ztuymil-vomx-tpekiumi", region: moldova, priority: 1}
+  - {id: rel_md_social,   type: rss, name: Europa Liberă, url: "https://www.europalibera.md/api/zkbympl-vomx-tpejvumm", region: moldova, priority: 1}
+  - {id: rel_md_economie, type: rss, name: Europa Liberă, url: "https://www.europalibera.md/api/z-bymyl-vomx-tpertumv", region: moldova, priority: 1}
+  - {id: rel_md_justitie, type: rss, name: Europa Liberă, url: "https://www.europalibera.md/api/z_bymvl-vomx-tpevvumt", region: moldova, priority: 1}
   - {id: diez,         type: rss, name: Diez,            url: "https://diez.md/feed/",           region: moldova, priority: 5}  # checked
-  - {id: ipn,          type: rss, name: IPN,             url: "https://www.ipn.md/ro/feed",      region: moldova, priority: 2, enabled: false}  # linked from ipn.md, but returned 404 when checked
+  # Dropped on 2026-10-24 after the source trust review; kept here disabled so older stories still show their names.
+  - {id: point,        type: rss, name: Point.md,        url: "https://point.md/ro/rss",         region: moldova, enabled: false}  # PressCheck: unverified/false single-source claims
+  - {id: realitatea_md, type: rss, name: Realitatea.md,  url: "https://realitatea.md/feed/",     region: moldova, enabled: false}
+  - {id: ipn,          type: rss, name: IPN,             url: "https://www.ipn.md/ro/feed",      region: moldova, enabled: false}  # same owner as Realitatea.md
 
   # --- Romania ---
   - {id: digi24,       type: rss, name: Digi24,          url: "https://www.digi24.ro/rss",       region: romania, priority: 1}  # checked
   - {id: g4media,      type: rss, name: G4Media,         url: "https://www.g4media.ro/feed",     region: romania, priority: 1}  # checked
   - {id: hotnews,      type: rss, name: HotNews,         url: "https://hotnews.ro/feed",         region: romania, priority: 1}  # checked
   - {id: newsro,       type: rss, name: News.ro,         url: "https://www.news.ro/rss",         region: romania, priority: 2}  # checked
-  - {id: adevarul,     type: rss, name: Adevărul,        url: "https://adevarul.ro/rss",         region: romania, priority: 3}  # checked
   - {id: mediafax,     type: rss, name: Mediafax,        url: "https://www.mediafax.ro/rss",     region: romania, priority: 3}  # checked
   - {id: spotmedia,    type: rss, name: Spotmedia,       url: "https://spotmedia.ro/feed",       region: romania, priority: 2}  # checked
   - {id: recorder,     type: rss, name: Recorder,        url: "https://recorder.ro/feed/",       region: romania, priority: 1, interval_minutes: 60}  # checked
   - {id: libertatea,   type: rss, name: Libertatea,      url: "https://www.libertatea.ro/rss",   region: romania, priority: 3, enabled: false}  # not checked
+  - {id: adevarul,     type: rss, name: Adevărul,        url: "https://adevarul.ro/rss",         region: romania, enabled: false}  # dropped 2026-10-24
 
   # --- International, in Romanian ---
   - {id: digi24_externe, type: rss, name: Digi24 Externe, url: "https://www.digi24.ro/rss/stiri/externe", region: world, priority: 1}  # checked
   - {id: dw_ro,        type: rss, name: DW România,      url: "https://rss.dw.com/rdf/rss-rom-all", region: world, priority: 2, enabled: false}  # not checked
+
+  # --- International, in English (the writer still writes the digest lines in Romanian) ---
+  - {id: euronews,     type: rss, name: Euronews,        url: "https://www.euronews.com/rss",    region: world, priority: 2}  # checked 2026-10-24
+  - {id: bbc_world,    type: rss, name: BBC,             url: "https://feeds.bbci.co.uk/news/world/rss.xml", region: world, priority: 2}  # not checked (blocked from here)
+  - {id: kyiv_independent, type: rss, name: Kyiv Independent, url: "https://kyivindependent.com/news-archive/rss/", region: world, priority: 3}  # checked 2026-10-24
 
   # --- Telegram channels (public web preview, no login) ---
   # - {id: some_channel, type: telegram, channel: some_public_channel, region: moldova, priority: 4}

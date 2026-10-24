@@ -263,11 +263,13 @@ class Publisher(Stage):
         out: dict[int, list[tuple[str, str]]] = {}
         for keep, ids in sel.event_ids.items():
             found = sorted((r for i in ids for r in by_story.get(i, [])), key=priority)
-            seen, links = {chosen[keep]["source_id"]}, []
+            seen, seen_urls, links = {chosen[keep]["source_id"]}, {chosen[keep]["url"]}, []
             for r in found:
-                if r["source_id"] in seen or r["url"] == chosen[keep]["url"]:
+                # one outlet can have several feeds (sections), so the same article may come in twice
+                if r["source_id"] in seen or r["url"] in seen_urls:
                     continue
                 seen.add(r["source_id"])
+                seen_urls.add(r["url"])
                 src = self.cfg.source(r["source_id"])
                 links.append((src.display_name if src else r["source_id"], r["url"]))
             if links:
