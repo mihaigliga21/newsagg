@@ -92,7 +92,19 @@ def template_line(title: str, emoji: str) -> dict:
     return {"emoji": emoji, "lead": lead, "rest": rest, "anchor": anchor}
 
 
-def render_line(line: dict, url: str) -> str:
+def render_sources(extra: list[tuple[str, str]] | None) -> str:
+    """Links to the other outlets that reported the story, e.g. " (+ <a>TV8</a>, <a>Unimedia</a>)"."""
+    if not extra:
+        return ""
+    links = ", ".join(f'<a href="{html.escape(u, quote=True)}">{html.escape(name)}</a>' for name, u in extra)
+    return f" (+ {links})"
+
+
+def render_line(line: dict, url: str, extra: list[tuple[str, str]] | None = None) -> str:
+    return _render_main(line, url) + render_sources(extra)
+
+
+def _render_main(line: dict, url: str) -> str:
     line = tidy_line(line)
     emoji = html.escape(line.get("emoji") or "📰")
     lead = html.escape((line.get("lead") or "").strip())

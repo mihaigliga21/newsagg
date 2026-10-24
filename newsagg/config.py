@@ -32,6 +32,7 @@ class ChannelConfig(BaseModel):
     schedule: list[str] = Field(default_factory=lambda: ["0 20 * * *"])
     header: str | None = "📰 <b>Știrile zilei, {date}</b>"
     lookback_hours: int = 24
+    max_extra_links: int = 3  # links to other outlets after a line several outlets reported (0: none)
     max_per_subject: int = 2  # at most this many lines about the same person or organisation
     repeat_window_hours: int = 48  # events in digests sent (or waiting for review) this recently are not repeated
 
@@ -91,6 +92,7 @@ class DedupeConfig(BaseModel):
     title_similarity: int = 85
     digest_similarity: int = 70  # at digest time, titles this similar count as one event
     min_tokens: int = 4
+    llm_recent_stories: int = 150  # newest stories the labeller compares new items with (0: titles only)
 
 
 class LLMConfig(BaseModel):

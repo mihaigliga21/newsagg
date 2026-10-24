@@ -34,12 +34,19 @@ class FakeLLM:
         if schema is ItemLabels:
             if self.fail_labels:
                 raise LLMError("down")
+            self.recent = payload["recent_stories"]
             out = []
-            for it in payload:
+            for it in payload["items"]:
                 t = it["title"]
                 region = "world" if "Ucraina" in t else "romania" if "București" in t else "moldova"
+                # Same happening = both mention a drone in Telenești.
+                drone = lambda x: "dron" in x.lower() and "Telenești" in x
+                same_story = next((s["id"] for s in self.recent if drone(t) and drone(s["title"])), 0)
+                same_item = next((o["id"] for o in payload["items"]
+                                  if o["id"] < it["id"] and drone(t) and drone(o["title"])), 0)
                 out.append(ItemLabel(id=it["id"], is_news="Horoscop" not in t, region=region,
-                                     topic="politics", importance=5 if "Parlament" in t else 3))
+                                     topic="politics", importance=5 if "Parlament" in t else 3,
+                                     same_story=same_story, same_item=same_item))
             return ItemLabels(items=out)
         if schema is DigestLines:
             return DigestLines(lines=[
@@ -159,6 +166,48 @@ async def test_full_pipeline(env):
 
     # Nothing left for the next digest.
     assert await pub.build_digest() is None
+
+
+async def test_same_happening_from_several_outlets_is_one_story_with_their_links(env):
+    cfg, db = env
+    await insert(db, "point", "a1", "O nouă dronă a căzut în satul Chiștelnița din raionul Telenești")
+    await insert(db, "unimedia", "b1", "Dronă găsită în raionul Telenești, la 100 de metri de o casă")
+    await insert(db, "digi24", "e1", "Primăria București anunță noi restricții de trafic în centru")
+    proc = Processor(cfg, db, llm=FakeLLM())
+    await proc.run_once()
+    # A later batch: the labeller sees the story among recent ones.
+    await insert(db, "tv8", "c1", "Telenești: drona s-a prăbușit lângă o locuință, anunță poliția")
+    await proc.run_once()
+
+    stories = await db.fetch("select * from stories order by id")
+    assert len(stories) == 2
+    drone = stories[0]
+    assert drone["source_count"] == 3
+    assert drone["source_id"] == "unimedia"  # best-ranked outlet takes the link
+
+    await Writer(cfg, db, llm=FakeLLM()).run_once()
+    bot = FakeBot()
+    await Publisher(cfg, db, bot=bot, llm=FakeLLM()).build_digest()
+    text = bot.sent[0][1]
+    assert text.count("Telenești") == 1
+    assert 'href="https://unimedia.md/b1"' in text
+    assert '(+ <a href="https://tv8.md/c1">TV8</a>, <a href="https://point.md/a1">Point.md</a>)' in text
+
+
+async def test_folded_stories_add_their_outlets_to_the_kept_line(env):
+    cfg, db = env
+    ids = await seed_repetitive_day(db)
+    for sid, src in [(ids["putin1"], "zdg"), (ids["putin2"], "tv8"), (ids["putin3"], "digi24_externe")]:
+        await db.execute("update stories set source_id = %s, url = %s where id = %s",
+                         (src, f"https://{src}/p{sid}", sid))
+    bot = FakeBot()
+    await Publisher(cfg, db, bot=bot, llm=FakeLLM()).build_digest()
+    text = bot.sent[0][1]
+    assert text.count("Putin") == 1
+    kept = f'https://digi24_externe/p{ids["putin3"]}'
+    others = f'(+ <a href="https://zdg/p{ids["putin1"]}">Ziarul de Gardă</a>, <a href="https://tv8/p{ids["putin2"]}">TV8</a>)'
+    line = next(ln for ln in text.split("\n\n") if "Putin" in ln)
+    assert kept in line and line.endswith(others)
 
 
 async def test_keyword_fallback_and_skip(env):
