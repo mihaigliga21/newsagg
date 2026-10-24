@@ -3,6 +3,7 @@ and post it to the channel once approved.
 
 Picking: stories are ranked by `score`; then an LLM groups the top candidates by real-world event
 so each event gets one line, and no person or organisation fills more than `max_per_subject` lines.
+The line links its own outlet; the other outlets that reported the event are linked after it.
 If the LLM is off or fails, the plain ranking is used.
 
 Missed slots: the last schedule slot that got a digest is kept in kv (`digest_last_slot`). A slot
@@ -35,6 +36,7 @@ CANDIDATES_PER_SLOT = 3  # how many ranked candidates per section slot the LLM s
 RETRY_DELAYS = (30, 120, 300, 600)  # seconds before each new try of a scheduled digest that failed
 CATCH_UP_GAP = timedelta(minutes=30)  # at start, don't catch up if the next slot is this close
 LAST_SLOT_KEY = "digest_last_slot"
+CURATE_MAX_TOKENS = 16000  # the plan is short, but some models spend output tokens on reasoning first
 
 
 def score(story: dict, now: datetime) -> float:
@@ -47,6 +49,12 @@ def score(story: dict, now: datetime) -> float:
     )
 
 
+def _grouping_failed(exc: Exception, section: str | None = None) -> str:
+    where = f" pentru secțiunea {section}" if section else ""
+    return (f"⚠️ Gruparea pe evenimente a eșuat{where} ({html.escape(str(exc)[:200])}); "
+            "am folosit doar ordinea și potrivirea după titlu.")
+
+
 def line_text(story: dict) -> str:
     line = tidy_line(story.get("line") or {})
     return join_text(line.get("lead") or "", line.get("rest") or "") or story["title"]
@@ -56,6 +64,7 @@ def line_text(story: dict) -> str:
 class Selection:
     by_section: dict[str, list[dict]]
     folded: list[int] = field(default_factory=list)  # same event as a chosen line, or already sent
+    event_ids: dict[int, list[int]] = field(default_factory=dict)  # chosen story id -> all story ids of its event
     repeats: int = 0  # events left out because a recent digest already had them
     notes: list[str] = field(default_factory=list)  # shown in the review chat
 
@@ -134,6 +143,7 @@ def apply_plan(
         if ev.subject:
             per_subject[ev.subject] = per_subject.get(ev.subject, 0) + 1
         sel.by_section[sec].append(stories[ev.keep])
+        sel.event_ids[ev.keep] = list(dict.fromkeys([ev.keep, *ev.ids]))
         sel.folded += [i for i in ev.ids if i != ev.keep]
     return sel
 
@@ -186,31 +196,91 @@ class Publisher(Stage):
         )
 
     async def plan_events(self, candidates: list[dict], sent: list[dict]) -> tuple[DigestPlan | None, list[str]]:
+        """Groups the candidates by event in one LLM call. If that fails (a reply too long for
+        max_tokens, a broken reply), each section is grouped on its own: smaller calls, at the
+        cost of not seeing events reported in two sections."""
         if not self.llm or not candidates:
             return None, []
-        payload = [{"id": c["id"], "section": c["section"], "title": c["title"], "text": line_text(c)}
-                   for c in candidates]
         sent_lines = list(dict.fromkeys(line_text(s) for s in sent))[:80]
         try:
-            plan = await self.llm.generate(
-                curate_system(self.cfg), curate_user(payload, sent_lines), DigestPlan, max_tokens=6000
-            )
+            plan = await self._plan(candidates, sent_lines)
         except Exception as exc:  # the digest must go out even if this step fails
-            self.log.warning("grouping digest candidates by event failed, using plain ranking: %s", exc)
-            return None, [f"⚠️ Gruparea pe evenimente a eșuat ({html.escape(str(exc)[:200])}); "
-                          "am folosit doar ordinea și potrivirea după titlu."]
+            by_section: dict[str, list[dict]] = {}
+            for c in candidates:
+                by_section.setdefault(c["section"], []).append(c)
+            if len(by_section) < 2:
+                return None, [_grouping_failed(exc)]
+            self.log.warning("grouping digest candidates by event failed (%s); grouping each section alone", exc)
+            plan, failed = DigestPlan(events=[]), []
+            for sec, cands in by_section.items():
+                try:
+                    plan.events += (await self._plan(cands, sent_lines)).events
+                except Exception as sec_exc:
+                    self.log.warning("grouping section %s by event failed: %s", sec, sec_exc)
+                    failed.append((sec, sec_exc))
+            if len(failed) == len(by_section):
+                return None, [_grouping_failed(failed[0][1])]
+            notes = [_grouping_failed(e, sec) for sec, e in failed]
+        else:
+            notes = []
         merged = sum(len(ev.ids) - 1 for ev in plan.events if ev.ids)
         repeats = sum(ev.already_sent for ev in plan.events)
         self.log.info("LLM grouped %d candidates into %d events (%d merged, %d already sent)",
                       len(candidates), len(plan.events), merged, repeats)
-        return plan, []
+        return plan, notes
 
-    def render(self, by_section: dict[str, list[dict]]) -> list[str]:
+    async def _plan(self, candidates: list[dict], sent_lines: list[str]) -> DigestPlan:
+        payload = [{"id": c["id"], "section": c["section"], "title": c["title"], "text": line_text(c)}
+                   for c in candidates]
+        return await self.llm.generate(
+            curate_system(self.cfg), curate_user(payload, sent_lines), DigestPlan, max_tokens=CURATE_MAX_TOKENS
+        )
+
+    async def more_sources(self, sel: Selection) -> dict[int, list[tuple[str, str]]]:
+        """For each chosen story, (outlet name, url) of the other outlets that reported its event:
+        items merged into its story or into the stories folded into it. Best-ranked outlets first,
+        one link per outlet, at most `channel.max_extra_links`."""
+        limit = self.cfg.channel.max_extra_links
+        if not limit or not sel.event_ids:
+            return {}
+        all_ids = [i for ids in sel.event_ids.values() for i in ids]
+        rows = await self.db.fetch(
+            """select story_id, source_id, url from raw_items
+               where story_id = any(%s) and status in ('accepted', 'duplicate')
+               union all
+               select id, source_id, url from stories where id = any(%s)""",
+            (all_ids, all_ids),
+        )
+        by_story: dict[int, list[dict]] = {}
+        for r in rows:
+            by_story.setdefault(r["story_id"], []).append(r)
+        chosen = {s["id"]: s for lst in sel.by_section.values() for s in lst}
+
+        def priority(r):
+            src = self.cfg.source(r["source_id"])
+            return src.priority if src else 5
+
+        out: dict[int, list[tuple[str, str]]] = {}
+        for keep, ids in sel.event_ids.items():
+            found = sorted((r for i in ids for r in by_story.get(i, [])), key=priority)
+            seen, links = {chosen[keep]["source_id"]}, []
+            for r in found:
+                if r["source_id"] in seen or r["url"] == chosen[keep]["url"]:
+                    continue
+                seen.add(r["source_id"])
+                src = self.cfg.source(r["source_id"])
+                links.append((src.display_name if src else r["source_id"], r["url"]))
+            if links:
+                out[keep] = links[:limit]
+        return out
+
+    def render(self, by_section: dict[str, list[dict]], extra: dict[int, list[tuple[str, str]]] | None = None) -> list[str]:
         header = self.cfg.channel.header
         if header:
             header = header.format(date=format_date(datetime.now(self.tz).date(), self.cfg.channel.language))
+        extra = extra or {}
         sections = [
-            (sec.title, [render_line(s["line"], s["url"]) for s in by_section.get(sec.id, [])])
+            (sec.title, [render_line(s["line"], s["url"], extra.get(s["id"])) for s in by_section.get(sec.id, [])])
             for sec in self.cfg.sections
         ]
         return render_digest(sections, header)
@@ -225,7 +295,7 @@ class Publisher(Stage):
             if self.review_chat:
                 await self.bot.send_message(self.review_chat, "\n".join(["Nu sunt știri noi pentru digest."] + notes))
             return None
-        parts = self.render(sel.by_section)
+        parts = self.render(sel.by_section, await self.more_sources(sel))
         folded = sel.folded
         status = "pending_review" if self.review_chat else "approved"
         async with self.db.tx() as conn:

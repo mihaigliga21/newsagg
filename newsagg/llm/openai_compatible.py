@@ -37,6 +37,14 @@ def _parse(content: str):
         return json_repair.loads(text)
 
 
+def _usage(data: dict) -> str:
+    """How the output tokens were spent, to tell a long answer from one eaten by reasoning."""
+    usage = data.get("usage") or {}
+    out = f"{usage.get('completion_tokens', '?')} output tokens"
+    reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    return f"{out}, {reasoning} of them reasoning" if reasoning else out
+
+
 def strict_schema(schema: dict) -> dict:
     """OpenAI strict mode wants every object closed and every property required."""
     if isinstance(schema, dict):
@@ -78,9 +86,10 @@ class OpenAICompatibleProvider(LLMProvider):
                     self.strict = False
                     resp = await self.http.post("/chat/completions", json=self._body(system, user, schema, max_tokens))
                 resp.raise_for_status()
-                choice = resp.json()["choices"][0]
+                data = resp.json()
+                choice = data["choices"][0]
                 if choice.get("finish_reason") == "length":
-                    raise LLMError("response hit max_tokens; lower the batch size")
+                    raise LLMError(f"response hit max_tokens ({_usage(data)}); lower the batch size")
                 return schema.model_validate(_parse(choice["message"]["content"]))
             except (json.JSONDecodeError, ValidationError) as exc:
                 if attempt == ATTEMPTS:

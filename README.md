@@ -11,9 +11,9 @@ Four services, one Docker image. They only talk through Postgres (Supabase). Eac
 | Service | Reads | Writes |
 |---|---|---|
 | `collector` | sources in `config/config.yaml`, each on its own interval | `raw_items` (status `new`) |
-| `processor` | `raw_items` with status `new` | labels region, topic and importance (LLM, keyword fallback), rejects ads and off-region items, merges duplicates into `stories` |
+| `processor` | `raw_items` with status `new` | labels region, topic and importance (LLM, keyword fallback), rejects ads and off-region items, merges items about the same happening into one story (the LLM compares each item with recent stories; title similarity is the fallback) |
 | `writer` | `stories` with status `pending_write` | the line (emoji, bold lead, sentence, link anchor) in `stories.line` |
-| `publisher` | `stories` with status `written`, on the cron in `channel.schedule` | keeps one line per event and drops events already sent (LLM grouping plus a title-similarity check; the review chat warns when the LLM step failed), builds the digest, sends it to your review chat with ✅ / ❌ buttons, posts it to the channel on ✅ |
+| `publisher` | `stories` with status `written`, on the cron in `channel.schedule` | keeps one line per event (an incident and its same-day follow-ups count as one), links the other outlets that reported it after the line, drops events already sent (LLM grouping plus a title-similarity check; the review chat warns when the LLM step failed), builds the digest, sends it to your review chat with ✅ / ❌ buttons, posts it to the channel on ✅ |
 
 In the review chat, `/digest` builds a digest right away and `/status` shows counts for the last 24 hours and failing sources.
 
@@ -52,7 +52,7 @@ Everything is in `config/config.yaml`:
 - **channel.repeat_window_hours**: events that were in a digest posted or waiting for review within this many hours are not repeated (default 48). A digest is never padded: on a quiet evening it is shorter, or not sent, and the review chat says how many repeats were left out.
 - **topics**: the emoji per topic.
 - **filter.blocklist**: words that drop an item before anything else (horoscopes, ads).
-- **dedupe**: time window and title similarity threshold for merging stories.
+- **dedupe**: time window and title similarity threshold for merging stories, and `llm_recent_stories` (how many recent stories the LLM labeller compares new items with).
 - **llm**: provider, model, batch size, `min_importance` (stories below it are kept for dedupe but not written or posted), and `curate` (at digest time, group candidates that report the same event and keep the best line).
 
 ### Changing the LLM

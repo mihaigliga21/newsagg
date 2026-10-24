@@ -255,7 +255,9 @@ def _provider(replies):
     def handler(request):
         content, finish = replies[len(calls)]
         calls.append(1)
-        return httpx.Response(200, json={"choices": [{"message": {"content": content}, "finish_reason": finish}]})
+        usage = {"completion_tokens": 6000, "completion_tokens_details": {"reasoning_tokens": 5200}}
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}, "finish_reason": finish}],
+                                         "usage": usage})
 
     prov = OpenAICompatibleProvider(LLMConfig(provider="openai_compatible", base_url="https://llm.test/v1", api_key="k"))
     prov.http = httpx.AsyncClient(base_url="https://llm.test/v1", transport=httpx.MockTransport(handler))
@@ -311,7 +313,7 @@ async def test_openai_compatible_reports_truncated_reply():
     from newsagg.llm import LLMError
 
     prov, _ = _provider([('{"events": [{"ids": [1', "length")])
-    with pytest.raises(LLMError, match="max_tokens"):
+    with pytest.raises(LLMError, match=r"max_tokens \(6000 output tokens, 5200 of them reasoning\)"):
         await prov.generate("s", "u", DigestPlan)
 
 
@@ -329,3 +331,19 @@ def test_typical_digest_fits_one_message():
     lines = [render_line(line, url)] * 13  # 6 + 4 + 3
     parts = render_digest([(None, lines[:6]), ("::: ROMÂNIA", lines[6:10]), ("::: EXTERNE", lines[10:])], header="📰 <b>Știrile zilei</b>")
     assert len(parts) == 1
+
+
+def test_render_line_lists_other_outlets():
+    line = {"emoji": "💥", "lead": "Dronă găsită", "rest": "în raionul Telenești", "anchor": "raionul Telenești"}
+    out = render_line(line, "https://x.md/1", [("TV8", "https://tv8.md/2"), ("A&B", "https://ab.md/3?a=1&b=2")])
+    assert out.endswith(' (+ <a href="https://tv8.md/2">TV8</a>, <a href="https://ab.md/3?a=1&amp;b=2">A&amp;B</a>)')
+    assert render_line(line, "https://x.md/1", []) == render_line(line, "https://x.md/1")
+
+
+def test_apply_plan_records_every_story_of_a_kept_event(monkeypatch):
+    c = cfg(monkeypatch)
+    ranked = {"moldova": [], "romania": [_story(1, "romania"), _story(2, "romania")],
+              "externe": [_story(5, "externe"), _story(6, "externe")]}
+    plan = DigestPlan(events=[_ev([1], 1, "a"), _ev([2], 2, "b"), _ev([5, 6], 6, "c", "world")])
+    sel = apply_plan(c, ranked, plan, {1: 4, 2: 3, 5: 2, 6: 1})
+    assert sel.event_ids == {1: [1], 2: [2], 6: [6, 5]}

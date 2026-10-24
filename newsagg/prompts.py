@@ -17,6 +17,8 @@ class ItemLabel(BaseModel):
     region: str = Field(description="one of the region ids, or 'other'")
     topic: str = Field(description="one of the topic ids")
     importance: int = Field(description="1 (trivial) to 5 (major national/international news)")
+    same_story: int = Field(0, description="id from `recent_stories` that reports the same happening, or 0")
+    same_item: int = Field(0, description="id of an earlier item in `items` that reports the same happening, or 0")
 
 
 class ItemLabels(BaseModel):
@@ -47,15 +49,21 @@ For each item decide:
 - other: none of the above
 - topic: one of: {topics}, default
 - importance: 1 trivial, 2 minor, 3 normal, 4 important, 5 major (national or international significance).
+- same_story: different outlets report the same happening in different words. If the item reports the same happening as one of `recent_stories` (the same incident, vote, decision, statement or announcement, even with other details or another angle), give that story's id. Examples of the same happening: "O dronă a căzut la 100 de metri de o casă din Chiștelnița" / "Dronă găsită în raionul Telenești"; "Parlamentul a adoptat politica fiscală" / "Deputații au votat noua politică fiscală". A later development caused by it (an official reaction, an expulsion, an arrest, a new vote) is a different happening: give 0. Give 0 when unsure.
+- same_item: the same, for an earlier item in `items` (a smaller id) that reports the same happening; otherwise 0.
 
 Return one label per input item, with the same id."""
 
 
-def classify_user(items: list[dict]) -> str:
-    payload = [
-        {"id": it["id"], "source": it["source_id"], "title": it["title"], "summary": (it.get("summary") or "")[:400]}
-        for it in items
-    ]
+def classify_user(items: list[dict], recent: list[dict] = ()) -> str:
+    payload = {
+        "items": [
+            {"id": it["id"], "source": it["source_id"], "title": it["title"],
+             "summary": (it.get("summary") or "")[:400]}
+            for it in items
+        ],
+        "recent_stories": [{"id": s["id"], "title": s["title"][:160]} for s in recent],
+    }
     return "Label these items:\n" + json.dumps(payload, ensure_ascii=False)
 
 
@@ -107,14 +115,16 @@ def curate_system(cfg: Config) -> str:
    - "Prima ședință CSAT cu miniștrii PSD, convocată de Nicușor Dan" / "CSAT se reunește în noul format"
    - "Hamas amenință Israelul cu un nou atac" / "Hamas amenință Israelul cu noi atacuri, similare masacrului din 7 octombrie"
    - "Putin acceptă să reia negocierile de pace" / "Kremlinul: negocierile se reiau luna viitoare"
-   Lines that only share a person but report different happenings are different events.
+   An incident and what follows from it within the digest's day are ONE event too: official reactions to it, statements about it, measures taken because of it (an expulsion, an arrest, an investigation), new details. For example these are all one event:
+   - "O dronă a căzut la 100 de metri de o casă din Chiștelnița, Telenești" / "Dronă găsită în raionul Telenești" / "Maia Sandu reacționează după căderea unei drone la Telenești" / "MAE: un diplomat rus, declarat persona non grata după ce o dronă s-a prăbușit în Telenești" / "Încă o dronă a încălcat spațiul aerian al Moldovei"
+   Lines that only share a person but report unrelated happenings are different events.
 2. For each event decide `already_sent`: true when a line in `already_sent` reports the same event, unless the candidate brings a real new development (a vote passed after a debate, a death toll that changed, a new decision). Rewording or extra detail is not a development.
 3. Decide the event's `region` from what it is about, not from the outlet: a Moldovan law reported by a Romanian site is moldova. Region ids:
 {regions}
 
 For each event return:
 - ids: every candidate id about it (each candidate belongs to exactly one event)
-- keep: the id whose line is most informative and specific; prefer higher ranked ids when they are equally good
+- keep: the id whose line covers the event best: the most important development (a measure taken or a decision beats the bare incident), informative and specific; prefer higher ranked ids when they are equally good
 - subject: the main person or organisation, written the same way every time it recurs (always "Luca Niculescu", never sometimes "Premierul Niculescu")
 - region: one of the region ids above
 - already_sent: as above

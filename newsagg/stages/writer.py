@@ -40,7 +40,7 @@ class Writer(Stage):
         if self.llm:
             try:
                 res = await self.llm.generate(
-                    write_system(self.cfg), write_user(stories), DigestLines, max_tokens=6000
+                    write_system(self.cfg), write_user(stories), DigestLines, max_tokens=12000
                 )
                 lines = {ln.id: ln.model_dump(exclude={"id"}) for ln in res.lines}
             except LLMError as exc:

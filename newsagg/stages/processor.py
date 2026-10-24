@@ -51,8 +51,11 @@ class Processor(Stage):
             else:
                 keep.append(it)
 
-        labels = await self._label(keep)
-        candidates = await self._recent_stories()
+        recent = await self._recent_stories()
+        labels = await self._label(keep, recent)
+        candidates = [(r["id"], r["norm_title"]) for r in recent]
+        recent_ids = {r["id"] for r in recent}
+        story_of: dict[int, int] = {}  # raw item id -> the story it became or joined
         accepted = dupes = rejected = 0
 
         for it in keep:
@@ -68,10 +71,15 @@ class Processor(Stage):
                 rejected += 1
                 continue
 
-            match = await self._same_url_story(it["url"]) or find_match(
-                it["title"], candidates, self.cfg.dedupe.title_similarity, self.cfg.dedupe.min_tokens
+            # The LLM's judgement first, then the title match as a fallback.
+            match = (
+                await self._same_url_story(it["url"])
+                or (lab["same_story"] if lab["same_story"] in recent_ids else None)
+                or story_of.get(lab["same_item"])
+                or find_match(it["title"], candidates, self.cfg.dedupe.title_similarity, self.cfg.dedupe.min_tokens)
             )
             if match:
+                story_of[it["id"]] = match
                 await self._merge(match, it, src, lab)
                 await self._finish(it["id"], "duplicate", None, match)
                 dupes += 1
@@ -88,6 +96,7 @@ class Processor(Stage):
                 ),
             )
             candidates.append((row["id"], normalize_title(it["title"])))
+            story_of[it["id"]] = row["id"]
             await self._finish(it["id"], "accepted", None, row["id"])
             accepted += 1
 
@@ -95,7 +104,7 @@ class Processor(Stage):
                       len(items), accepted, dupes, rejected + len(items) - len(keep))
         return len(items)
 
-    async def _label(self, items: list[dict]) -> dict[int, dict]:
+    async def _label(self, items: list[dict], recent: list[dict] = ()) -> dict[int, dict]:
         out: dict[int, dict] = {}
         if self.llm and items:
             size = self.cfg.llm.batch_size
@@ -103,7 +112,8 @@ class Processor(Stage):
                 chunk = items[i : i + size]
                 try:
                     res = await self.llm.generate(
-                        classify_system(self.cfg), classify_user(chunk), ItemLabels, max_tokens=4000
+                        classify_system(self.cfg), classify_user(chunk, recent[: self.cfg.dedupe.llm_recent_stories]),
+                        ItemLabels, max_tokens=8000
                     )
                     for lab in res.items:
                         topic = lab.topic if lab.topic in self.cfg.topics else "default"
@@ -112,6 +122,8 @@ class Processor(Stage):
                             "region": lab.region,
                             "topic": topic,
                             "importance": max(1, min(5, lab.importance)),
+                            "same_story": lab.same_story,
+                            "same_item": lab.same_item if lab.same_item < lab.id else 0,
                         }
                 except LLMError as exc:
                     self.log.warning("LLM labelling failed, using keywords for %d items: %s", len(chunk), exc)
@@ -123,15 +135,18 @@ class Processor(Stage):
                     "region": self.keywords.region(it["title"], it["summary"], src.region if src else None),
                     "topic": self.keywords.topic(it["title"], it["summary"]),
                     "importance": 3,
+                    "same_story": 0,
+                    "same_item": 0,
                 }
         return out
 
-    async def _recent_stories(self) -> list[tuple[int, str]]:
-        rows = await self.db.fetch(
-            "select id, norm_title from stories where created_at > now() - make_interval(hours => %s)",
+    async def _recent_stories(self) -> list[dict]:
+        """Stories of the dedupe window, newest first."""
+        return await self.db.fetch(
+            """select id, norm_title, title from stories
+               where created_at > now() - make_interval(hours => %s) order by id desc""",
             (self.cfg.dedupe.window_hours,),
         )
-        return [(r["id"], r["norm_title"]) for r in rows]
 
     async def _same_url_story(self, url: str) -> int | None:
         row = await self.db.fetchone(
