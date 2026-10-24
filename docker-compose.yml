@@ -48,7 +48,7 @@ services:
       POSTGRES_USER: newsagg
       POSTGRES_PASSWORD: newsagg
       POSTGRES_DB: newsagg
-    ports: ["5432:5432"]
+    ports: ["5433:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
 
 volumes:

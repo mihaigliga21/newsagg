@@ -8,7 +8,7 @@ channel:
   review_chat_id: ${TELEGRAM_REVIEW_CHAT_ID}  # your private chat with the bot; drafts go here first
   language: ro
   timezone: Europe/Chisinau
-  schedule: ["0 20 * * *"]                     # daily at 20:00; add more cron lines for more digests
+  schedule: ["0 12 * * *", "0 17 * * *", "0 20 * * *", "0 22 * * *"]                     # daily; add more cron lines for more digests
   lookback_hours: 24
   max_extra_links: 3                           # links to other outlets that reported the same event, after its line
   max_per_subject: 2                           # at most 2 lines about the same person or organisation

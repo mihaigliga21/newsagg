@@ -6,3 +6,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+/.idea/.gitignore
+/.idea/modules.xml
+/.idea/newsagg.iml
+/.idea/vcs.xml
