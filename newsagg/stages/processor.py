@@ -117,9 +117,12 @@ class Processor(Stage):
                     )
                     for lab in res.items:
                         topic = lab.topic if lab.topic in self.cfg.topics else "default"
+                        region = lab.region.strip().lower()
+                        if region not in self.cfg.regions and region != "other":
+                            continue  # a made-up region (smaller models do this): use the keywords
                         out[lab.id] = {
                             "is_news": lab.is_news,
-                            "region": lab.region,
+                            "region": region,
                             "topic": topic,
                             "importance": max(1, min(5, lab.importance)),
                             "same_story": lab.same_story,

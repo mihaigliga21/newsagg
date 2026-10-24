@@ -347,3 +347,86 @@ def test_apply_plan_records_every_story_of_a_kept_event(monkeypatch):
     plan = DigestPlan(events=[_ev([1], 1, "a"), _ev([2], 2, "b"), _ev([5, 6], 6, "c", "world")])
     sel = apply_plan(c, ranked, plan, {1: 4, 2: 3, 5: 2, 6: 1})
     assert sel.event_ids == {1: [1], 2: [2], 6: [6, 5]}
+
+
+def test_empty_env_var_gets_the_default(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "")  # `LLM_PROVIDER=` in .env
+    monkeypatch.setenv("LLM_MODEL", "qwen3:8b")
+    c = cfg(monkeypatch)
+    assert c.llm.provider == "openai_compatible" and c.llm.model == "qwen3:8b"
+
+
+def _ollama(handler, **cfg_kw):
+    import httpx
+
+    from newsagg.config import LLMConfig
+    from newsagg.llm import build_provider
+
+    llm = build_provider(LLMConfig(provider="ollama", model="qwen3:8b", think=False, **cfg_kw))
+    llm.http = httpx.AsyncClient(base_url=str(llm.http.base_url), transport=httpx.MockTransport(handler))
+    return llm
+
+
+def _ollama_reply(content, done_reason="stop", prompt_tokens=900):
+    import httpx
+
+    return httpx.Response(200, json={"message": {"role": "assistant", "content": content},
+                                     "done_reason": done_reason, "prompt_eval_count": prompt_tokens,
+                                     "eval_count": 120})
+
+
+async def test_ollama_provider_sends_context_window_and_schema():
+    import json
+
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        return _ollama_reply('{"events": [{"ids": [1, 2], "keep": 2, "subject": "Maia Sandu", '
+                             '"region": "moldova", "already_sent": false}]}')
+
+    llm = _ollama(handler, base_url="http://host.docker.internal:11434/v1/", num_ctx=8192)
+    assert str(llm.http.base_url).rstrip("/") == "http://host.docker.internal:11434"  # /v1 is dropped
+    plan = await llm.generate("system", "user", DigestPlan, max_tokens=500)
+    assert plan.events[0].ids == [1, 2]
+    path, body = seen[0]
+    assert path == "/api/chat" and body["think"] is False and body["stream"] is False
+    assert body["options"] == {"num_ctx": 8192, "num_predict": 500}
+    assert "$defs" not in body["format"] and "$ref" not in json.dumps(body["format"])
+    assert body["format"]["properties"]["events"]["items"]["properties"]["keep"]["type"] == "integer"
+
+
+async def test_ollama_provider_errors_are_explained():
+    import httpx
+    import pytest
+
+    from newsagg.llm import LLMError
+
+    llm = _ollama(lambda r: _ollama_reply("{}", prompt_tokens=16384))
+    with pytest.raises(LLMError, match="raise llm.num_ctx"):
+        await llm.generate("s", "u", DigestPlan)
+    llm = _ollama(lambda r: _ollama_reply('{"events": [', done_reason="length"))
+    with pytest.raises(LLMError, match="hit max_tokens"):
+        await llm.generate("s", "u", DigestPlan)
+    llm = _ollama(lambda r: httpx.Response(404, json={"error": "model 'qwen3:8b' not found"}))
+    with pytest.raises(LLMError, match="ollama pull qwen3:8b"):
+        await llm.generate("s", "u", DigestPlan)
+
+
+async def test_ollama_provider_drops_think_for_models_without_it():
+    import httpx
+
+    bodies = []
+
+    def handler(request):
+        import json
+
+        bodies.append(json.loads(request.content))
+        if "think" in bodies[-1]:
+            return httpx.Response(400, json={"error": '"llama3.1:8b" does not support thinking'})
+        return _ollama_reply('{"events": []}')
+
+    llm = _ollama(handler)
+    assert (await llm.generate("s", "u", DigestPlan)).events == []
+    assert (await llm.generate("s", "u", DigestPlan)).events == []
+    assert len(bodies) == 3  # the second call goes straight through

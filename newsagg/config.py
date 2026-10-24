@@ -15,7 +15,8 @@ _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 def _expand_env(value):
     if isinstance(value, str):
-        return _ENV_RE.sub(lambda m: os.environ.get(m.group(1), m.group(2) or ""), value)
+        # Like the shell's ${VAR:-default}: an empty variable gets the default too.
+        return _ENV_RE.sub(lambda m: os.environ.get(m.group(1)) or m.group(2) or "", value)
     if isinstance(value, list):
         return [_expand_env(v) for v in value]
     if isinstance(value, dict):
@@ -97,11 +98,17 @@ class DedupeConfig(BaseModel):
 
 class LLMConfig(BaseModel):
     enabled: bool = True
-    provider: Literal["anthropic", "openai_compatible"] = "anthropic"
+    provider: Literal["anthropic", "openai_compatible", "ollama"] = "anthropic"
     model: str = "claude-haiku-5-5"
     api_key: str | None = None
     base_url: str | None = None
     effort: str | None = "low"
+    temperature: float | None = None  # openai_compatible and ollama; None: the provider's default
+    timeout_seconds: int | None = None  # per request; None: 120, or 600 for ollama
+    # ollama only
+    num_ctx: int = 16384  # context window in tokens; the prompts need about 10k
+    think: bool | None = None  # false turns off the thinking mode of reasoning models (much faster)
+    keep_alive: str | None = None  # how long the model stays loaded after a call, e.g. "30m"
     classify: bool = True
     write_lines: bool = True
     curate: bool = True  # at digest time, keep one line per event (same event reported several ways)

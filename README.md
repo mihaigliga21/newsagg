@@ -23,7 +23,7 @@ If a scheduled digest fails (after a few retries) or its slot passes while the p
 
 1. **Supabase:** create a project. Copy the *Session pooler* connection string (port 5432) from Project Settings > Database. The transaction pooler (port 6543) does not support `LISTEN`.
 2. **Telegram:** create a bot with @BotFather. Add it to your channel as an admin with "Post messages". Send `/start` to the bot from your own account, and get your user id from @userinfobot (that is the review chat id).
-3. **LLM:** an Anthropic API key (default model `claude-haiku-5-5`).
+3. **LLM:** an API key for Anthropic or an OpenAI-style provider such as OpenRouter, or a local model with Ollama (see below).
 4. `cp .env.example .env` and fill it in.
 5. `docker compose up -d --build`
 
@@ -38,6 +38,7 @@ docker compose run --rm collector test-source zdg     # fetch one source and pri
 docker compose run --rm publisher digest --dry-run    # print the digest that would be built now
 docker compose run --rm publisher digest              # build one now and send it for review
 docker compose restart                                # after editing config/config.yaml
+docker compose run --rm -T publisher llm-bench --model qwen3:8b > bench.md   # compare a local model (read-only)
 ```
 
 Without Docker: `pip install -e ".[dev]"`, then `newsagg migrate`, `newsagg run all` (all four stages in one process) or `newsagg run collector` etc.
@@ -57,9 +58,32 @@ Everything is in `config/config.yaml`:
 
 ### Changing the LLM
 
-`llm.provider: anthropic` uses the Anthropic SDK. `llm.provider: openai_compatible` works with any OpenAI-style API (OpenAI, Gemini, Mistral, Groq, OpenRouter, a local Ollama): set `llm.model`, `LLM_API_KEY` and `LLM_BASE_URL` (for example `https://api.openai.com/v1` or `http://host.docker.internal:11434/v1`). To add another provider, implement `LLMProvider.generate` in `newsagg/llm/` and register it in `build_provider`.
+`llm.provider` and `llm.model` can be set in `config/config.yaml` or, to switch without editing it, with `LLM_PROVIDER` and `LLM_MODEL` in `.env`.
+
+- `anthropic` uses the Anthropic SDK (`LLM_API_KEY`).
+- `openai_compatible` works with any OpenAI-style API (OpenAI, Gemini, Mistral, Groq, OpenRouter): set `LLM_API_KEY` and `LLM_BASE_URL` (for example `https://api.openai.com/v1`).
+- `ollama` runs a local model (below).
+
+To add another provider, implement `LLMProvider.generate` in `newsagg/llm/` and register it in `build_provider`.
 
 With `llm.enabled: false` everything still runs: keyword labelling and a template line (title split into a bold lead and a linked tail).
+
+### Local models with Ollama
+
+1. Install [Ollama](https://ollama.com) on the machine that runs Docker and pull a model: `ollama pull qwen3:8b`. Models that write Romanian reasonably well and fit an 8-12 GB GPU include `qwen3:8b` and `gemma3:12b`; bigger is better at grouping events.
+2. In `.env`: `LLM_PROVIDER=ollama`, `LLM_MODEL=qwen3:8b`, and leave `LLM_API_KEY` and `LLM_BASE_URL` empty. The containers reach Ollama at `http://host.docker.internal:11434` (set `LLM_BASE_URL` if it runs elsewhere).
+3. Before switching, compare it with the current model on your own recent data. This labels, writes and groups again and writes a report, without changing anything:
+   `docker compose run --rm -T publisher llm-bench --model qwen3:8b > bench.md`
+4. `docker compose up -d`
+
+The `ollama` provider uses Ollama's own API rather than its OpenAI-style `/v1` one, because only the native API can set the context window. Ollama's default window (2-4k tokens) would silently cut the labelling and grouping prompts, which need about 10k. Settings under `llm` (ignored by the other providers):
+
+- `num_ctx` (default 16384): the context window. A larger one uses more GPU memory. If a prompt fills it, the call fails with a message saying so, and the stage falls back as it does for any LLM failure.
+- `think: false`: turns off the thinking mode of reasoning models such as `qwen3`, which is much faster. Ignored for models without one.
+- `keep_alive` (default `30m` in the config): how long the model stays loaded between batches.
+- `timeout_seconds` (default 600 for Ollama): a slow GPU or CPU may need more, or a smaller `batch_size`.
+
+Replies are constrained to the JSON schema, so they are always valid JSON; what a smaller model gets wrong is the content (a region, an event grouping). Ollama runs one request at a time by default, so the stages wait for each other.
 
 ## Tests
 

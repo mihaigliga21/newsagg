@@ -505,3 +505,20 @@ async def test_failed_slot_stays_missed(env):
     pub.select_stories = down
     await pub.scheduled_digest(pub.now())
     assert await db.kv_get("digest_last_slot") == "2026-10-23T09:00:00+03:00"
+
+
+async def test_llm_bench_reads_real_data_and_writes_nothing(env):
+    from newsagg.bench import run_bench
+
+    cfg, db = env
+    await insert(db, "zdg", "a1", "Parlamentul a votat în secret noua structură a Armatei Naționale")
+    await insert(db, "digi24", "d1", "Atacuri rusești în Ucraina: zeci de morți după lovirea a două autobuze")
+    await Processor(cfg, db, llm=FakeLLM()).run_once()
+    await Writer(cfg, db, llm=FakeLLM()).run_once()
+    before = await db.fetch("select id, status, line from stories order by id")
+
+    report = await run_bench(cfg, db, [cfg.llm, cfg.llm], size=10, build=lambda _: FakeLLM())
+    assert report.count("### Labelling") == 2 and "Failed" not in report
+    assert "2/2 labels returned" in report and "region 2/2" in report
+    assert "2/2 lines returned" in report and "2 candidates → 2 events" in report
+    assert await db.fetch("select id, status, line from stories order by id") == before
