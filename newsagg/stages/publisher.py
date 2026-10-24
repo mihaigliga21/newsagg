@@ -36,6 +36,7 @@ CANDIDATES_PER_SLOT = 3  # how many ranked candidates per section slot the LLM s
 RETRY_DELAYS = (30, 120, 300, 600)  # seconds before each new try of a scheduled digest that failed
 CATCH_UP_GAP = timedelta(minutes=30)  # at start, don't catch up if the next slot is this close
 LAST_SLOT_KEY = "digest_last_slot"
+CURATE_MAX_TOKENS = 16000  # the plan is short, but some models spend output tokens on reasoning first
 
 
 def score(story: dict, now: datetime) -> float:
@@ -46,6 +47,12 @@ def score(story: dict, now: datetime) -> float:
         + (10 - min(story["source_priority"], 10))
         - age_h * 0.5
     )
+
+
+def _grouping_failed(exc: Exception, section: str | None = None) -> str:
+    where = f" pentru secțiunea {section}" if section else ""
+    return (f"⚠️ Gruparea pe evenimente a eșuat{where} ({html.escape(str(exc)[:200])}); "
+            "am folosit doar ordinea și potrivirea după titlu.")
 
 
 def line_text(story: dict) -> str:
@@ -189,24 +196,45 @@ class Publisher(Stage):
         )
 
     async def plan_events(self, candidates: list[dict], sent: list[dict]) -> tuple[DigestPlan | None, list[str]]:
+        """Groups the candidates by event in one LLM call. If that fails (a reply too long for
+        max_tokens, a broken reply), each section is grouped on its own: smaller calls, at the
+        cost of not seeing events reported in two sections."""
         if not self.llm or not candidates:
             return None, []
-        payload = [{"id": c["id"], "section": c["section"], "title": c["title"], "text": line_text(c)}
-                   for c in candidates]
         sent_lines = list(dict.fromkeys(line_text(s) for s in sent))[:80]
         try:
-            plan = await self.llm.generate(
-                curate_system(self.cfg), curate_user(payload, sent_lines), DigestPlan, max_tokens=6000
-            )
+            plan = await self._plan(candidates, sent_lines)
         except Exception as exc:  # the digest must go out even if this step fails
-            self.log.warning("grouping digest candidates by event failed, using plain ranking: %s", exc)
-            return None, [f"⚠️ Gruparea pe evenimente a eșuat ({html.escape(str(exc)[:200])}); "
-                          "am folosit doar ordinea și potrivirea după titlu."]
+            by_section: dict[str, list[dict]] = {}
+            for c in candidates:
+                by_section.setdefault(c["section"], []).append(c)
+            if len(by_section) < 2:
+                return None, [_grouping_failed(exc)]
+            self.log.warning("grouping digest candidates by event failed (%s); grouping each section alone", exc)
+            plan, failed = DigestPlan(events=[]), []
+            for sec, cands in by_section.items():
+                try:
+                    plan.events += (await self._plan(cands, sent_lines)).events
+                except Exception as sec_exc:
+                    self.log.warning("grouping section %s by event failed: %s", sec, sec_exc)
+                    failed.append((sec, sec_exc))
+            if len(failed) == len(by_section):
+                return None, [_grouping_failed(failed[0][1])]
+            notes = [_grouping_failed(e, sec) for sec, e in failed]
+        else:
+            notes = []
         merged = sum(len(ev.ids) - 1 for ev in plan.events if ev.ids)
         repeats = sum(ev.already_sent for ev in plan.events)
         self.log.info("LLM grouped %d candidates into %d events (%d merged, %d already sent)",
                       len(candidates), len(plan.events), merged, repeats)
-        return plan, []
+        return plan, notes
+
+    async def _plan(self, candidates: list[dict], sent_lines: list[str]) -> DigestPlan:
+        payload = [{"id": c["id"], "section": c["section"], "title": c["title"], "text": line_text(c)}
+                   for c in candidates]
+        return await self.llm.generate(
+            curate_system(self.cfg), curate_user(payload, sent_lines), DigestPlan, max_tokens=CURATE_MAX_TOKENS
+        )
 
     async def more_sources(self, sel: Selection) -> dict[int, list[tuple[str, str]]]:
         """For each chosen story, (outlet name, url) of the other outlets that reported its event:

@@ -255,7 +255,9 @@ def _provider(replies):
     def handler(request):
         content, finish = replies[len(calls)]
         calls.append(1)
-        return httpx.Response(200, json={"choices": [{"message": {"content": content}, "finish_reason": finish}]})
+        usage = {"completion_tokens": 6000, "completion_tokens_details": {"reasoning_tokens": 5200}}
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}, "finish_reason": finish}],
+                                         "usage": usage})
 
     prov = OpenAICompatibleProvider(LLMConfig(provider="openai_compatible", base_url="https://llm.test/v1", api_key="k"))
     prov.http = httpx.AsyncClient(base_url="https://llm.test/v1", transport=httpx.MockTransport(handler))
@@ -311,7 +313,7 @@ async def test_openai_compatible_reports_truncated_reply():
     from newsagg.llm import LLMError
 
     prov, _ = _provider([('{"events": [{"ids": [1', "length")])
-    with pytest.raises(LLMError, match="max_tokens"):
+    with pytest.raises(LLMError, match=r"max_tokens \(6000 output tokens, 5200 of them reasoning\)"):
         await prov.generate("s", "u", DigestPlan)
 
 

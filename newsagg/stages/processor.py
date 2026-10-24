@@ -113,7 +113,7 @@ class Processor(Stage):
                 try:
                     res = await self.llm.generate(
                         classify_system(self.cfg), classify_user(chunk, recent[: self.cfg.dedupe.llm_recent_stories]),
-                        ItemLabels, max_tokens=4000
+                        ItemLabels, max_tokens=8000
                     )
                     for lab in res.items:
                         topic = lab.topic if lab.topic in self.cfg.topics else "default"

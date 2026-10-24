@@ -22,9 +22,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class FakeLLM:
-    def __init__(self, fail_labels=False, fail_plan=False):
+    def __init__(self, fail_labels=False, fail_plan=False, plan_limit=None):
         self.fail_labels = fail_labels
         self.fail_plan = fail_plan
+        self.plan_limit = plan_limit  # more candidates than this: the reply "hits max_tokens"
         self.plan_calls = 0
 
     async def generate(self, system, user, schema, max_tokens=4000):
@@ -59,6 +60,8 @@ class FakeLLM:
             self.plan_calls += 1
             if self.fail_plan:
                 raise LLMError("down")
+            if self.plan_limit and len(payload["candidates"]) > self.plan_limit:
+                raise LLMError("response hit max_tokens (6000 output tokens); lower the batch size")
             self.sent = payload["already_sent"]
             groups, sections = {}, {}
             for c in payload["candidates"]:
@@ -341,6 +344,27 @@ async def test_grouping_failure_is_shown_in_review(env):
     bot = FakeBot()
     await Publisher(cfg, db, bot=bot, llm=FakeLLM(fail_plan=True)).build_digest()
     assert "⚠️ Gruparea pe evenimente a eșuat (down)" in bot.sent[-1][1]
+
+
+async def test_grouping_too_long_for_one_reply_is_done_per_section(env):
+    cfg, db = env
+    await seed_repetitive_day(db)
+    bot, llm = FakeBot(), FakeLLM(plan_limit=6)  # 9 candidates in all: 5 externe, 4 romania
+    await Publisher(cfg, db, bot=bot, llm=llm).build_digest()
+    assert llm.plan_calls == 3  # all at once, then each section
+    text = bot.sent[0][1]
+    assert text.count("Putin") == 1 and text.count("Niculescu") == 2
+    assert "⚠️" not in bot.sent[-1][1]
+
+
+async def test_grouping_failure_in_one_section_is_shown_and_others_still_merge(env):
+    cfg, db = env
+    await seed_repetitive_day(db)
+    await add_story(db, "externe", "Putin acceptă un armistițiu de o lună în Ucraina", 0)  # 6 externe now
+    bot = FakeBot()
+    await Publisher(cfg, db, bot=bot, llm=FakeLLM(plan_limit=5)).build_digest()
+    assert "Gruparea pe evenimente a eșuat pentru secțiunea externe (response hit max_tokens" in bot.sent[-1][1]
+    assert bot.sent[0][1].count("Niculescu") == 2  # romania was still grouped by the LLM
 
 
 async def kill_pool_connections(db):
