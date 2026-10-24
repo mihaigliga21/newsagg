@@ -58,42 +58,65 @@ def strict_schema(schema: dict) -> dict:
 
 
 class OpenAICompatibleProvider(LLMProvider):
+    name = "openai_compatible"
+    default_timeout = 120
+
     def __init__(self, cfg):
         super().__init__(cfg)
-        if not cfg.base_url:
-            raise ValueError("llm.base_url is required for openai_compatible (e.g. https://api.openai.com/v1)")
+        base_url = cfg.base_url or self.default_base_url()
         headers = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
-        self.http = httpx.AsyncClient(base_url=cfg.base_url.rstrip("/"), headers=headers, timeout=120)
+        timeout = cfg.timeout_seconds or self.default_timeout
+        self.http = httpx.AsyncClient(base_url=base_url.rstrip("/"), headers=headers, timeout=timeout)
         self.strict = True  # turned off if the provider rejects strict schemas
+
+    def default_base_url(self) -> str:
+        raise ValueError("llm.base_url is required for openai_compatible (e.g. https://api.openai.com/v1)")
 
     def _body(self, system: str, user: str, schema: type[T], max_tokens: int) -> dict:
         json_schema = {"name": schema.__name__, "schema": schema.model_json_schema()}
         if self.strict:
             json_schema.update(strict=True, schema=strict_schema(json_schema["schema"]))
-        return {
+        body = {
             "model": self.cfg.model,
             "max_tokens": max_tokens,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "response_format": {"type": "json_schema", "json_schema": json_schema},
         }
+        if self.cfg.temperature is not None:
+            body["temperature"] = self.cfg.temperature
+        return body
+
+    async def _complete(self, system: str, user: str, schema: type[T], max_tokens: int) -> str:
+        """The reply text for one request."""
+        resp = await self.http.post("/chat/completions", json=self._body(system, user, schema, max_tokens))
+        if resp.status_code == 400 and self.strict:
+            log.warning("provider rejected the strict schema (%s); using a plain one", resp.text[:300])
+            self.strict = False
+            resp = await self.http.post("/chat/completions", json=self._body(system, user, schema, max_tokens))
+        resp.raise_for_status()
+        data = resp.json()
+        choice = data["choices"][0]
+        if choice.get("finish_reason") == "length":
+            raise LLMError(f"response hit max_tokens ({_usage(data)}); lower the batch size")
+        return choice["message"]["content"]
 
     async def generate(self, system: str, user: str, schema: type[T], max_tokens: int = 4000) -> T:
         for attempt in range(1, ATTEMPTS + 1):
             try:
-                resp = await self.http.post("/chat/completions", json=self._body(system, user, schema, max_tokens))
-                if resp.status_code == 400 and self.strict:
-                    log.warning("provider rejected the strict schema (%s); using a plain one", resp.text[:300])
-                    self.strict = False
-                    resp = await self.http.post("/chat/completions", json=self._body(system, user, schema, max_tokens))
-                resp.raise_for_status()
-                data = resp.json()
-                choice = data["choices"][0]
-                if choice.get("finish_reason") == "length":
-                    raise LLMError(f"response hit max_tokens ({_usage(data)}); lower the batch size")
-                return schema.model_validate(_parse(choice["message"]["content"]))
+                content = await self._complete(system, user, schema, max_tokens)
+                return schema.model_validate(_parse(content))
             except (json.JSONDecodeError, ValidationError) as exc:
                 if attempt == ATTEMPTS:
-                    raise LLMError(f"openai_compatible call failed: {exc}") from exc
+                    raise LLMError(f"{self.name} call failed: {exc}") from exc
                 log.warning("LLM reply did not fit %s (%s); asking again", schema.__name__, exc)
             except (httpx.HTTPError, KeyError, TypeError) as exc:
-                raise LLMError(f"openai_compatible call failed: {exc}") from exc
+                raise LLMError(f"{self.name} call failed: {_http_detail(exc)}") from exc
+
+
+def _http_detail(exc: Exception) -> str:
+    """httpx errors say little on their own: add the response body, or the timeout's cause."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{exc} {exc.response.text[:300]}"
+    if isinstance(exc, httpx.TimeoutException):
+        return f"timed out ({type(exc).__name__}); raise llm.timeout_seconds or lower the batch size"
+    return str(exc) or type(exc).__name__

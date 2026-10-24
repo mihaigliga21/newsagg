@@ -13,6 +13,8 @@ x-app: &app
   restart: unless-stopped
   volumes:
     - ./config:/app/config:ro      # edit config.yaml, then `docker compose restart`
+  extra_hosts:
+    - "host.docker.internal:host-gateway"  # reach Ollama on this machine (built in on Docker Desktop, needed on Linux)
 
 services:
   migrate:
