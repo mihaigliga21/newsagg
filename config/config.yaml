@@ -111,11 +111,17 @@ dedupe:
 
 llm:
   enabled: true
-  provider: openai_compatible          # or openai_compatible (OpenAI, Gemini, Mistral, Groq, OpenRouter, Ollama)
-  model: anthropic/claude-haiku-5.5
+  # anthropic, openai_compatible (OpenAI, Gemini, Mistral, Groq, OpenRouter) or ollama (a local model).
+  # LLM_PROVIDER and LLM_MODEL in .env override these, so you can switch without editing this file.
+  provider: ${LLM_PROVIDER:-openai_compatible}
+  model: ${LLM_MODEL:-anthropic/claude-haiku-5.5}
   api_key: ${LLM_API_KEY}
-  base_url: ${LLM_BASE_URL:-}  # only for openai_compatible, e.g. https://api.openai.com/v1
-  effort: low
+  base_url: ${LLM_BASE_URL:-}  # openai_compatible: e.g. https://api.openai.com/v1; ollama: default http://host.docker.internal:11434
+  effort: low                  # anthropic only
+  # ollama only (see "Local models with Ollama" in the README):
+  num_ctx: 16384               # context window; the labelling and grouping prompts need about 10k tokens
+  think: false                 # no thinking mode for reasoning models such as qwen3: much faster
+  keep_alive: 30m              # keep the model loaded between batches
   classify: true
   write_lines: true
   curate: true                 # at digest time, group lines by event and keep one per event

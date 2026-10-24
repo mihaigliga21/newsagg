@@ -15,6 +15,10 @@ def build_provider(cfg) -> LLMProvider:
         from .openai_compatible import OpenAICompatibleProvider
 
         return OpenAICompatibleProvider(cfg)
+    if cfg.provider == "ollama":
+        from .ollama import OllamaProvider
+
+        return OllamaProvider(cfg)
     raise ValueError(f"unknown LLM provider {cfg.provider!r}")
 
 
